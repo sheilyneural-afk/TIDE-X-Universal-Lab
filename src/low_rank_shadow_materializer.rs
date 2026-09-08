@@ -294,9 +294,15 @@ impl ShadowLowRankCandidate {
     fn calculate_digest(&self) -> BrainResult<Sha256Digest> {
         let mut unsigned = self.clone();
         unsigned.manifest_sha256 = Sha256Digest::zero();
+        // Normalize through the actual JSON wire representation. Numerical
+        // factors can be rounded to their shortest round-trippable decimal by
+        // serde_json; hashing the normalized value keeps identity stable after
+        // persistence while semantic validation still checks reconstructed f64s.
+        let wire_value: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&unsigned)?)?;
         Ok(Sha256Digest::digest_domain(
             b"CEREBRO:TIDEX:SHADOW-LOW-RANK-CANDIDATE:v1\0",
-            &serde_json::to_vec(&unsigned)?,
+            &serde_json::to_vec(&wire_value)?,
         ))
     }
 
@@ -307,10 +313,126 @@ impl ShadowLowRankCandidate {
         layout: &ReceiverMaterializationLayout,
         policy: &LowRankShadowPolicy,
     ) -> BrainResult<()> {
-        let expected = build_candidate(request, receipt, layout, policy)?;
-        if self != &expected {
+        replay_universal_capability_shadow_plan(request, receipt)?;
+        layout.validate_for(&request.receiver_profile, &request.receiver_snapshot)?;
+        policy.validate()?;
+        let shadow = &receipt.shadow_plan;
+        let target = &shadow.compilation_receipt.compilation.receiver.target_delta;
+        if shadow.materialization_plan.strategy != MaterializationStrategy::LowRank {
+            return Err(BrainError::Invalid(
+                "shadow_low_rank_strategy_required".into(),
+            ));
+        }
+        if self.schema != "cerebro.tidex.shadow_low_rank_candidate/v1"
+            || self.planning_request_sha256 != receipt.planning_request_sha256
+            || self.receiver_layout_sha256 != layout.manifest_sha256
+            || self.policy_sha256 != policy.digest()?
+            || self.target_delta_sha256 != values_digest(target)?
+            || self.aliases != layout.aliases
+        {
             return Err(BrainError::Integrity(
-                "shadow_low_rank_candidate_invalid".into(),
+                "shadow_low_rank_binding_invalid".into(),
+            ));
+        }
+        if self.manifest_sha256 != self.calculate_digest()? {
+            return Err(BrainError::Integrity(
+                "shadow_low_rank_manifest_invalid".into(),
+            ));
+        }
+        let affected = shadow
+            .materialization_plan
+            .affected_regions
+            .iter()
+            .collect::<BTreeSet<_>>();
+        let mut tensors = self.tensors.iter();
+        for ((block, physical), region) in layout
+            .geometry
+            .layout
+            .blocks
+            .iter()
+            .zip(&layout.physical_tensors)
+            .zip(&request.receiver_profile.regions)
+        {
+            let start = usize::try_from(block.offset)
+                .map_err(|_| BrainError::Invalid("shadow_low_rank_offset_overflow".into()))?;
+            let end = start
+                .checked_add(block.count)
+                .ok_or_else(|| BrainError::Invalid("shadow_low_rank_range_overflow".into()))?;
+            let dense = target
+                .get(start..end)
+                .ok_or_else(|| BrainError::Integrity("shadow_low_rank_range_invalid".into()))?;
+            if !affected.contains(&region.tensor_id) {
+                if dense.iter().any(|value| *value != 0.0) {
+                    return Err(BrainError::Integrity(
+                        "shadow_low_rank_nonzero_outside_planned_regions".into(),
+                    ));
+                }
+                continue;
+            }
+            let tensor = tensors
+                .next()
+                .ok_or_else(|| BrainError::Integrity("shadow_low_rank_tensor_missing".into()))?;
+            let factors = &tensor.factors;
+            let factor_count = factors
+                .rows
+                .checked_mul(factors.rank)
+                .and_then(|count| count.checked_add(factors.rank.checked_mul(factors.columns)?))
+                .ok_or_else(|| BrainError::Invalid("low_rank_factor_shape_overflow".into()))?;
+            let expected_reduction = 1.0 - factor_count as f64 / block.count as f64;
+            if block.shape.len() != 2
+                || tensor.tensor_id != region.tensor_id
+                || tensor.shape != block.shape
+                || tensor.base_encoding != physical.encoding
+                || tensor.partitioning != physical.partitioning
+                || tensor.dense_values_sha256 != values_digest(dense)?
+                || factors.schema != "cerebro.tidex.verified_low_rank_factors/v1"
+                || factors.rows != block.shape[0]
+                || factors.columns != block.shape[1]
+                || factors.rank == 0
+                || factors.rank > policy.maximum_rank
+                || factors.left.len() != factors.rows * factors.rank
+                || factors.right.len() != factors.rank * factors.columns
+                || factors
+                    .left
+                    .iter()
+                    .chain(&factors.right)
+                    .any(|value| !value.is_finite())
+                || factors.dense_parameter_count != block.count
+                || factors.factor_parameter_count != factor_count
+                || (factors.parameter_reduction_ratio - expected_reduction).abs() > 1e-12
+                || factors.parameter_reduction_ratio < policy.minimum_parameter_reduction_ratio
+            {
+                return Err(BrainError::Integrity(
+                    "shadow_low_rank_factor_contract_invalid".into(),
+                ));
+            }
+            let reconstructed = factors.materialize_dense()?;
+            let residual = dense
+                .iter()
+                .zip(&reconstructed)
+                .map(|(expected, actual)| expected - actual)
+                .collect::<Vec<_>>();
+            let absolute = norm(&residual)?;
+            let target_norm = norm(dense)?;
+            let relative = if target_norm == 0.0 {
+                0.0
+            } else {
+                absolute / target_norm
+            };
+            let error_slack = 1e-12 * (1.0 + absolute.abs() + relative.abs());
+            if (absolute - factors.absolute_reconstruction_error).abs() > error_slack
+                || (relative - factors.relative_reconstruction_error).abs() > error_slack
+                || !(absolute <= policy.absolute_reconstruction_tolerance
+                    || relative <= policy.relative_reconstruction_tolerance)
+            {
+                return Err(BrainError::Integrity(
+                    "shadow_low_rank_reconstruction_invalid".into(),
+                ));
+            }
+        }
+        if tensors.next().is_some() {
+            return Err(BrainError::Integrity(
+                "shadow_low_rank_tensor_surplus".into(),
             ));
         }
         Ok(())
@@ -400,6 +522,10 @@ fn build_candidate(
         aliases: layout.aliases.clone(),
         manifest_sha256: Sha256Digest::zero(),
     };
+    // Canonicalize floating-point wire values before assigning artifact
+    // identity so a persisted candidate has exactly the same semantics and
+    // digest after deserialization.
+    candidate = serde_json::from_slice(&serde_json::to_vec(&candidate)?)?;
     candidate.manifest_sha256 = candidate.calculate_digest()?;
     Ok(candidate)
 }

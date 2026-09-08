@@ -1,0 +1,7 @@
+{
+  "schema": "cerebro.tidex.activation_steering_policy/v1",
+  "maximum_vector_l2": 20.0,
+  "maximum_absolute_component": 5.0,
+  "maximum_gain": 2.0,
+  "allow_zero_vector": false
+}

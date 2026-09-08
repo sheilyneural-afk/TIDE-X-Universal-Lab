@@ -348,6 +348,10 @@ mod tests {
         PrimitiveId, TensorId,
     };
     use crate::lab_isolation::LabRoots;
+    use crate::low_rank_shadow_materializer::{
+        load_low_rank_shadow, materialize_replayed_low_rank_shadow, persist_low_rank_shadow,
+        LowRankShadowPolicy,
+    };
     use crate::receiver_layout::{
         FloatingScalarType, ReceiverMaterializationLayout, ReceiverScalarEncoding,
         ReceiverTensorPartitioning, ReceiverTensorPhysicalSpec,
@@ -752,6 +756,157 @@ mod tests {
             load_dense_delta_shadow(&roots, &dense_request, &dense_receipt, &layout, &reference,)
                 .unwrap(),
             dense_candidate
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn low_rank_full_chain_replays_persists_reloads_and_detects_tampering() {
+        let (root, envelope, ir, operational) = fixture();
+        let functional = calibration();
+        let query = operational.canonical_transition_signature(&ir).unwrap();
+        let left = [1.0, 2.0, 3.0, 4.0];
+        let right = [0.5, -1.0, 2.0, 0.25];
+        let target = left
+            .iter()
+            .flat_map(|a| right.iter().map(move |b| a * b))
+            .collect::<Vec<_>>();
+        let query_norm_squared = query.iter().map(|v| v * v).sum::<f64>();
+        let solve = |signature: &[f64]| {
+            let coefficient =
+                query.iter().zip(signature).map(|(a, b)| a * b).sum::<f64>() / query_norm_squared;
+            (0..16)
+                .map(|index| {
+                    let embedded = signature.get(index).copied().unwrap_or(0.0);
+                    let query_embedded = query.get(index).copied().unwrap_or(0.0);
+                    embedded + (target[index] - query_embedded) * coefficient
+                })
+                .collect::<Vec<_>>()
+        };
+        let tensor_id = TensorId::parse("layers.0.low_rank.weight").unwrap();
+        let geometry = ParameterLayoutArtifact::new(
+            ParameterBlockLayout::from_shapes(&[BlockShapeSpec {
+                name: tensor_id.as_str().into(),
+                shape: vec![4, 4],
+                count: 16,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+        let profile = ReceiverProfile {
+            schema: "cerebro.tidex.receiver_profile/v1".into(),
+            model_id: ModelId::parse("receiver.low-rank.v1").unwrap(),
+            architecture_id: ArchitectureId::parse("transformer.v1").unwrap(),
+            architecture: ReceiverArchitecture::Transformer,
+            modalities: BTreeSet::from([CapabilityModality::Text]),
+            supports_persistent_state: false,
+            parameter_dimension: 16,
+            regions: vec![ReceiverRegion {
+                tensor_id: tensor_id.clone(),
+                parameter_count: 16,
+                supported_strategies: BTreeSet::from([MaterializationStrategy::LowRank]),
+            }],
+        };
+        let layout = ReceiverMaterializationLayout::create(
+            &profile,
+            geometry,
+            vec![ReceiverTensorPhysicalSpec {
+                tensor_id: tensor_id.clone(),
+                encoding: ReceiverScalarEncoding::Floating {
+                    scalar_type: FloatingScalarType::Float64,
+                },
+                partitioning: ReceiverTensorPartitioning::Replicated,
+            }],
+            vec![],
+        )
+        .unwrap();
+        let snapshot = ReceiverSnapshotBinding::create(
+            &profile,
+            Sha256Digest::digest_bytes(b"low-rank-model"),
+            Sha256Digest::digest_bytes(b"config"),
+            Sha256Digest::digest_bytes(b"tokenizer"),
+            layout.manifest_sha256.clone(),
+        )
+        .unwrap();
+        let request = UniversalCapabilityPlanningRequest {
+            schema: "cerebro.tidex.universal_capability_planning_request/v1".into(),
+            compilation: UniversalCapabilityCompilationRequest {
+                schema: "cerebro.tidex.universal_capability_compilation_request/v1".into(),
+                system_envelope: envelope,
+                capability_ir: ir.clone(),
+                operational_contract: operational,
+                calibration: ReceiverCalibrationSet {
+                    receiver_snapshot_binding_sha256: snapshot.manifest_digest().clone(),
+                    functional_signatures: functional.clone(),
+                    receiver_solutions: functional.iter().map(|row| solve(row)).collect(),
+                    wrong_functional_signatures: vec![functional[0].clone(), functional[2].clone()],
+                },
+                protected_cortex: ProtectedCortex {
+                    parameter_importance: vec![0.0; 16],
+                    directions: vec![],
+                    max_damage_ratio: 0.01,
+                },
+                risk_metric_rows: (0..16)
+                    .map(|row| (0..16).map(|column| f64::from(row == column)).collect())
+                    .collect(),
+                policy: ReceiverCompilerPolicy {
+                    schema: "cerebro.tidex.receiver_compiler_policy/v1".into(),
+                    ridge: 1e-10,
+                    minimum_decoder_loo_r2: 0.999,
+                    minimum_encoder_loo_r2: 0.999,
+                    minimum_decoder_loo_cosine: 0.999,
+                    maximum_functional_relative_error: 1e-4,
+                    minimum_identity_margin: 0.05,
+                    maximum_quadratic_cost: 1e9,
+                },
+            },
+            receiver_profile: profile,
+            receiver_snapshot: snapshot,
+            capability_requirements: CapabilityRequirements {
+                schema: "cerebro.tidex.capability_requirements/v1".into(),
+                capability_id: ir.capability_id().clone(),
+                capability_ir_sha256: ir.manifest_digest().clone(),
+                required_modalities: BTreeSet::from([CapabilityModality::Text]),
+                requires_persistent_state: false,
+                minimum_receiver_parameter_dimension: 16,
+                acceptable_strategies: BTreeSet::from([MaterializationStrategy::LowRank]),
+            },
+            requested_strategy: MaterializationStrategy::LowRank,
+            affected_regions: vec![tensor_id],
+        };
+        let receipt = execute_universal_capability_shadow_plan(&request).unwrap();
+        let policy = LowRankShadowPolicy {
+            schema: "cerebro.tidex.low_rank_shadow_policy/v1".into(),
+            maximum_rank: 1,
+            relative_reconstruction_tolerance: 1e-6,
+            absolute_reconstruction_tolerance: 1e-6,
+            minimum_parameter_reduction_ratio: 0.4,
+            maximum_svd_sweeps: 100,
+        };
+        let candidate =
+            materialize_replayed_low_rank_shadow(&request, &receipt, &layout, &policy).unwrap();
+        let lab = root.join("lab");
+        let state = lab.join("state");
+        let artifacts = lab.join("artifacts");
+        let production = root.join("production");
+        for directory in [&lab, &state, &artifacts, &production] {
+            fs::create_dir_all(directory).unwrap();
+            crate::security::secure_dir(directory).unwrap();
+        }
+        let roots = LabRoots::open_for_test(&lab, &state, &artifacts, &production).unwrap();
+        let reference =
+            persist_low_rank_shadow(&roots, &request, &receipt, &layout, &policy, &candidate)
+                .unwrap();
+        assert_eq!(
+            load_low_rank_shadow(&roots, &request, &receipt, &layout, &policy, &reference)
+                .unwrap_or_else(|error| panic!("low-rank reload failed: {error:?}")),
+            candidate
+        );
+        let mut bad_reference = reference;
+        bad_reference.sha256 = Sha256Digest::zero();
+        assert!(
+            load_low_rank_shadow(&roots, &request, &receipt, &layout, &policy, &bad_reference)
+                .is_err()
         );
         fs::remove_dir_all(root).unwrap();
     }

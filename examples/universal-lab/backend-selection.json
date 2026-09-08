@@ -1,0 +1,29 @@
+{
+  "schema": "cerebro.tidex.backend_selection_policy/v1",
+  "minimum_functional_ci_lower": 0.8,
+  "minimum_preservation_score": 0.95,
+  "minimum_identity_margin": 0.05,
+  "minimum_numerical_stability": 0.99,
+  "maximum_normalized_risk": 0.1,
+  "maximum_latency_micros": 1000000,
+  "maximum_resident_bytes": 1073741824,
+  "functional_weight": 0.35,
+  "preservation_weight": 0.25,
+  "stability_weight": 0.15,
+  "risk_weight": 0.1,
+  "latency_weight": 0.075,
+  "memory_weight": 0.075,
+  "required_controls": [
+    "unmodified_receiver",
+    "dense_delta",
+    "conventional_low_rank",
+    "wrong_capability_ir",
+    "random_delta",
+    "mean_capability",
+    "nearest_capability",
+    "alternative_backend",
+    "non_target_preservation"
+  ],
+  "allow_hybrid": true,
+  "minimum_hybrid_complementarity": 0.05
+}
