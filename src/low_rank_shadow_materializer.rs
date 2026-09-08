@@ -3,14 +3,31 @@
 //! This module factors an already compiled dense tensor delta. It does not
 //! define capability identity and has no model-loading or activation API.
 
+use crate::authority::{write_or_verify_immutable, PrivateFileReference};
+use crate::digest::Sha256Digest;
 use crate::error::{BrainError, BrainResult};
+use crate::identity::TensorId;
+use crate::lab_isolation::LabRoots;
 use crate::linalg::{norm, symmetric_eigen_jacobi, Matrix};
+use crate::receiver_layout::{
+    ReceiverMaterializationLayout, ReceiverScalarEncoding, ReceiverTensorAlias,
+    ReceiverTensorPartitioning,
+};
+use crate::receiver_profile::MaterializationStrategy;
 use crate::solver_portfolio::CandidateRepresentation;
+use crate::universal_capability_compiler::{
+    replay_universal_capability_shadow_plan, UniversalCapabilityPlanningRequest,
+    UniversalCapabilityShadowPlanReceipt,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 const MAX_FACTOR_INPUT_ELEMENTS: usize = 16 * 1024 * 1024;
-const MAX_FACTOR_IDENTITY_ELEMENTS: usize = 16 * 1024 * 1024;
+const MAX_FACTOR_GRAM_ELEMENTS: usize = 16 * 1024 * 1024;
 const MAX_SHADOW_RANK: usize = 64;
+const MAX_LOW_RANK_SHADOW_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_SVD_SWEEPS: usize = 1_000;
+const MAX_SVD_ROTATIONS: usize = 100_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -29,7 +46,7 @@ impl LowRankShadowPolicy {
             || self.maximum_rank == 0
             || self.maximum_rank > MAX_SHADOW_RANK
             || !self.relative_reconstruction_tolerance.is_finite()
-            || self.relative_reconstruction_tolerance < 0.0
+            || !(0.0..1.0).contains(&self.relative_reconstruction_tolerance)
             || !self.absolute_reconstruction_tolerance.is_finite()
             || self.absolute_reconstruction_tolerance < 0.0
             || self.relative_reconstruction_tolerance == 0.0
@@ -37,10 +54,19 @@ impl LowRankShadowPolicy {
             || !self.minimum_parameter_reduction_ratio.is_finite()
             || !(0.0..1.0).contains(&self.minimum_parameter_reduction_ratio)
             || self.maximum_svd_sweeps == 0
+            || self.maximum_svd_sweeps > MAX_SVD_SWEEPS
         {
             return Err(BrainError::Invalid("low_rank_shadow_policy_invalid".into()));
         }
         Ok(())
+    }
+
+    pub fn digest(&self) -> BrainResult<Sha256Digest> {
+        self.validate()?;
+        Ok(Sha256Digest::digest_domain(
+            b"CEREBRO:TIDEX:LOW-RANK-SHADOW-POLICY:v1\0",
+            &serde_json::to_vec(self)?,
+        ))
     }
 }
 
@@ -83,14 +109,15 @@ pub fn factor_dense_delta_verified(
     let dense_count = rows
         .checked_mul(columns)
         .ok_or_else(|| BrainError::Invalid("low_rank_dense_shape_overflow".into()))?;
-    let identity_count = columns
-        .checked_mul(columns)
-        .ok_or_else(|| BrainError::Invalid("low_rank_identity_shape_overflow".into()))?;
+    let spectral_dimension = rows.min(columns);
+    let gram_count = spectral_dimension
+        .checked_mul(spectral_dimension)
+        .ok_or_else(|| BrainError::Invalid("low_rank_gram_shape_overflow".into()))?;
     if rows == 0
         || columns == 0
         || dense.len() != dense_count
         || dense_count > MAX_FACTOR_INPUT_ELEMENTS
-        || identity_count > MAX_FACTOR_IDENTITY_ELEMENTS
+        || gram_count > MAX_FACTOR_GRAM_ELEMENTS
         || dense.iter().any(|value| !value.is_finite())
     {
         return Err(BrainError::Invalid("low_rank_dense_input_invalid".into()));
@@ -105,7 +132,6 @@ pub fn factor_dense_delta_verified(
             "low_rank_zero_delta_has_no_factors".into(),
         ));
     }
-    let spectral_dimension = rows.min(columns);
     let mut gram = Matrix::zeros(spectral_dimension, spectral_dimension);
     if rows <= columns {
         for first in 0..rows {
@@ -138,6 +164,9 @@ pub fn factor_dense_delta_verified(
         .checked_mul(spectral_dimension)
         .and_then(|value| value.checked_mul(policy.maximum_svd_sweeps))
         .ok_or_else(|| BrainError::Invalid("low_rank_svd_work_overflow".into()))?;
+    if rotations > MAX_SVD_ROTATIONS {
+        return Err(BrainError::Invalid("low_rank_svd_work_limit".into()));
+    }
     let eigen = symmetric_eigen_jacobi(&gram, 1.0e-12, rotations)?;
     let maximum_rank = policy.maximum_rank.min(eigen.len());
     for rank in 1..=maximum_rank {
@@ -228,6 +257,211 @@ pub fn factor_dense_delta_verified(
     Err(BrainError::Numerical(
         "low_rank_factorization_not_admissible".into(),
     ))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowLowRankTensorDelta {
+    pub tensor_id: TensorId,
+    pub shape: Vec<usize>,
+    pub base_encoding: ReceiverScalarEncoding,
+    pub partitioning: ReceiverTensorPartitioning,
+    pub dense_values_sha256: Sha256Digest,
+    pub factors: VerifiedLowRankFactors,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowLowRankCandidate {
+    pub schema: String,
+    pub planning_request_sha256: Sha256Digest,
+    pub receiver_layout_sha256: Sha256Digest,
+    pub policy_sha256: Sha256Digest,
+    pub target_delta_sha256: Sha256Digest,
+    pub tensors: Vec<ShadowLowRankTensorDelta>,
+    pub aliases: Vec<ReceiverTensorAlias>,
+    pub manifest_sha256: Sha256Digest,
+}
+
+fn values_digest(values: &[f64]) -> BrainResult<Sha256Digest> {
+    Ok(Sha256Digest::digest_domain(
+        b"CEREBRO:TIDEX:SHADOW-LOW-RANK-DENSE-VALUES:v1\0",
+        &serde_json::to_vec(values)?,
+    ))
+}
+
+impl ShadowLowRankCandidate {
+    fn calculate_digest(&self) -> BrainResult<Sha256Digest> {
+        let mut unsigned = self.clone();
+        unsigned.manifest_sha256 = Sha256Digest::zero();
+        Ok(Sha256Digest::digest_domain(
+            b"CEREBRO:TIDEX:SHADOW-LOW-RANK-CANDIDATE:v1\0",
+            &serde_json::to_vec(&unsigned)?,
+        ))
+    }
+
+    pub fn validate(
+        &self,
+        request: &UniversalCapabilityPlanningRequest,
+        receipt: &UniversalCapabilityShadowPlanReceipt,
+        layout: &ReceiverMaterializationLayout,
+        policy: &LowRankShadowPolicy,
+    ) -> BrainResult<()> {
+        let expected = build_candidate(request, receipt, layout, policy)?;
+        if self != &expected {
+            return Err(BrainError::Integrity(
+                "shadow_low_rank_candidate_invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn build_candidate(
+    request: &UniversalCapabilityPlanningRequest,
+    receipt: &UniversalCapabilityShadowPlanReceipt,
+    layout: &ReceiverMaterializationLayout,
+    policy: &LowRankShadowPolicy,
+) -> BrainResult<ShadowLowRankCandidate> {
+    replay_universal_capability_shadow_plan(request, receipt)?;
+    layout.validate_for(&request.receiver_profile, &request.receiver_snapshot)?;
+    policy.validate()?;
+    let shadow = &receipt.shadow_plan;
+    if shadow.materialization_plan.strategy != MaterializationStrategy::LowRank {
+        return Err(BrainError::Invalid(
+            "shadow_low_rank_strategy_required".into(),
+        ));
+    }
+    let target = &shadow.compilation_receipt.compilation.receiver.target_delta;
+    if target.len() > MAX_FACTOR_INPUT_ELEMENTS
+        || target.iter().any(|value| !value.is_finite())
+        || u64::try_from(target.len())
+            .map_err(|_| BrainError::Invalid("shadow_low_rank_target_overflow".into()))?
+            != layout.geometry.total_parameter_count
+    {
+        return Err(BrainError::Integrity(
+            "shadow_low_rank_target_invalid".into(),
+        ));
+    }
+    let affected = shadow
+        .materialization_plan
+        .affected_regions
+        .iter()
+        .collect::<BTreeSet<_>>();
+    let mut tensors = Vec::with_capacity(affected.len());
+    for ((block, physical), region) in layout
+        .geometry
+        .layout
+        .blocks
+        .iter()
+        .zip(&layout.physical_tensors)
+        .zip(&request.receiver_profile.regions)
+    {
+        let start = usize::try_from(block.offset)
+            .map_err(|_| BrainError::Invalid("shadow_low_rank_offset_overflow".into()))?;
+        let end = start
+            .checked_add(block.count)
+            .ok_or_else(|| BrainError::Invalid("shadow_low_rank_range_overflow".into()))?;
+        let values = target
+            .get(start..end)
+            .ok_or_else(|| BrainError::Integrity("shadow_low_rank_range_invalid".into()))?;
+        if affected.contains(&region.tensor_id) {
+            if block.shape.len() != 2 {
+                return Err(BrainError::Invalid(
+                    "shadow_low_rank_tensor_must_be_matrix".into(),
+                ));
+            }
+            tensors.push(ShadowLowRankTensorDelta {
+                tensor_id: region.tensor_id.clone(),
+                shape: block.shape.clone(),
+                base_encoding: physical.encoding.clone(),
+                partitioning: physical.partitioning.clone(),
+                dense_values_sha256: values_digest(values)?,
+                factors: factor_dense_delta_verified(
+                    block.shape[0],
+                    block.shape[1],
+                    values,
+                    policy,
+                )?,
+            });
+        } else if values.iter().any(|value| *value != 0.0) {
+            return Err(BrainError::Integrity(
+                "shadow_low_rank_nonzero_outside_planned_regions".into(),
+            ));
+        }
+    }
+    let mut candidate = ShadowLowRankCandidate {
+        schema: "cerebro.tidex.shadow_low_rank_candidate/v1".into(),
+        planning_request_sha256: receipt.planning_request_sha256.clone(),
+        receiver_layout_sha256: layout.manifest_sha256.clone(),
+        policy_sha256: policy.digest()?,
+        target_delta_sha256: values_digest(target)?,
+        tensors,
+        aliases: layout.aliases.clone(),
+        manifest_sha256: Sha256Digest::zero(),
+    };
+    candidate.manifest_sha256 = candidate.calculate_digest()?;
+    Ok(candidate)
+}
+
+pub fn materialize_replayed_low_rank_shadow(
+    request: &UniversalCapabilityPlanningRequest,
+    receipt: &UniversalCapabilityShadowPlanReceipt,
+    layout: &ReceiverMaterializationLayout,
+    policy: &LowRankShadowPolicy,
+) -> BrainResult<ShadowLowRankCandidate> {
+    let candidate = build_candidate(request, receipt, layout, policy)?;
+    candidate.validate(request, receipt, layout, policy)?;
+    Ok(candidate)
+}
+
+pub fn persist_low_rank_shadow(
+    roots: &LabRoots,
+    request: &UniversalCapabilityPlanningRequest,
+    receipt: &UniversalCapabilityShadowPlanReceipt,
+    layout: &ReceiverMaterializationLayout,
+    policy: &LowRankShadowPolicy,
+    candidate: &ShadowLowRankCandidate,
+) -> BrainResult<PrivateFileReference> {
+    candidate.validate(request, receipt, layout, policy)?;
+    let bytes = serde_json::to_vec(candidate)?;
+    if u64::try_from(bytes.len())
+        .map_err(|_| BrainError::Invalid("shadow_low_rank_size_overflow".into()))?
+        > MAX_LOW_RANK_SHADOW_BYTES
+    {
+        return Err(BrainError::Invalid(
+            "shadow_low_rank_candidate_too_large".into(),
+        ));
+    }
+    let destination = roots
+        .artifact_root()
+        .join("low-rank-shadow-candidates")
+        .join(format!("{}.json", candidate.manifest_sha256));
+    let sha256 = write_or_verify_immutable(roots.lab_root(), &destination, &bytes)?;
+    Ok(PrivateFileReference::new(destination, sha256))
+}
+
+pub fn load_low_rank_shadow(
+    roots: &LabRoots,
+    request: &UniversalCapabilityPlanningRequest,
+    receipt: &UniversalCapabilityShadowPlanReceipt,
+    layout: &ReceiverMaterializationLayout,
+    policy: &LowRankShadowPolicy,
+    reference: &PrivateFileReference,
+) -> BrainResult<ShadowLowRankCandidate> {
+    let bytes = reference.read_verified_bounded(roots.lab_root(), MAX_LOW_RANK_SHADOW_BYTES)?;
+    let candidate: ShadowLowRankCandidate = serde_json::from_slice(&bytes)?;
+    let expected_path = roots
+        .artifact_root()
+        .join("low-rank-shadow-candidates")
+        .join(format!("{}.json", candidate.manifest_sha256));
+    if reference.path != expected_path {
+        return Err(BrainError::Integrity(
+            "shadow_low_rank_candidate_path_invalid".into(),
+        ));
+    }
+    candidate.validate(request, receipt, layout, policy)?;
+    Ok(candidate)
 }
 
 #[cfg(test)]
