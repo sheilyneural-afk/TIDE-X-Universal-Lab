@@ -34,6 +34,7 @@ pub mod portfolio_governance;
 pub mod protected;
 pub mod pure_capability_e2e;
 pub mod receiver_compiler;
+pub mod receiver_layout;
 pub mod receiver_profile;
 pub mod receiver_profiler;
 pub mod representation_evidence;

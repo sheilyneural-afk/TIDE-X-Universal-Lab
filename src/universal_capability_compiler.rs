@@ -348,6 +348,10 @@ mod tests {
         PrimitiveId, TensorId,
     };
     use crate::lab_isolation::LabRoots;
+    use crate::receiver_layout::{
+        FloatingScalarType, ReceiverMaterializationLayout, ReceiverScalarEncoding,
+        ReceiverTensorPartitioning, ReceiverTensorPhysicalSpec,
+    };
     use crate::receiver_profile::{CapabilityModality, ReceiverArchitecture, ReceiverRegion};
     use crate::shadow_materializer::materialize_replayed_receiver_coordinates_shadow;
     use std::collections::BTreeSet;
@@ -574,7 +578,7 @@ mod tests {
     fn replayed_plan_materializes_only_the_compiler_target_delta() {
         let (root, envelope, ir, operational) = fixture();
         let functional = calibration();
-        let layout = ParameterLayoutArtifact::new(
+        let geometry = ParameterLayoutArtifact::new(
             ParameterBlockLayout::from_shapes(&[BlockShapeSpec {
                 name: "layers.0.receiver_coordinates".into(),
                 shape: vec![5],
@@ -600,12 +604,25 @@ mod tests {
                 ]),
             }],
         };
+        let layout = ReceiverMaterializationLayout::create(
+            &profile,
+            geometry,
+            vec![ReceiverTensorPhysicalSpec {
+                tensor_id: TensorId::parse("layers.0.receiver_coordinates").unwrap(),
+                encoding: ReceiverScalarEncoding::Floating {
+                    scalar_type: FloatingScalarType::Float64,
+                },
+                partitioning: ReceiverTensorPartitioning::Replicated,
+            }],
+            vec![],
+        )
+        .unwrap();
         let snapshot = ReceiverSnapshotBinding::create(
             &profile,
             Sha256Digest::digest_bytes(b"model"),
             Sha256Digest::digest_bytes(b"config"),
             Sha256Digest::digest_bytes(b"tokenizer"),
-            layout.parameter_layout_sha256.as_digest().clone(),
+            layout.manifest_sha256.clone(),
         )
         .unwrap();
         let requirements = CapabilityRequirements {
@@ -706,7 +723,7 @@ mod tests {
             .is_err());
 
         let mut wrong_layout = layout.clone();
-        wrong_layout.layout.blocks[0].shape = vec![1, 5];
+        wrong_layout.geometry.layout.blocks[0].shape = vec![1, 5];
         assert!(materialize_replayed_dense_delta_shadow(
             &dense_request,
             &dense_receipt,
