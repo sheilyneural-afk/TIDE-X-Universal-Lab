@@ -20,6 +20,7 @@ pub mod identity;
 pub mod interaction;
 pub mod isolated_execution;
 pub mod knowledge_engine;
+pub mod lab_isolation;
 pub mod learned_controller;
 pub mod learning_finalization;
 pub mod learning_orchestrator;
