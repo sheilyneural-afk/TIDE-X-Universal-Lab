@@ -37,6 +37,7 @@ pub mod representation_evidence;
 pub mod residency_decision;
 pub mod sbas;
 pub mod security;
+pub mod shadow_materializer;
 pub mod tomography;
 pub mod transport;
 pub mod validation;
