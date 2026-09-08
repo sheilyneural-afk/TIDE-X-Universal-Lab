@@ -20,6 +20,7 @@ use crate::receiver_profile::{
     assess_compatibility, create_shadow_plan, CapabilityRequirements, CompatibilityAssessment,
     MaterializationPlan, MaterializationStrategy, ReceiverProfile,
 };
+use crate::receiver_profiler::ReceiverSnapshotBinding;
 use serde::{Deserialize, Serialize};
 
 /// Portable input envelope for one experimental receiver compilation.
@@ -78,6 +79,7 @@ pub struct UniversalCapabilityPlanningRequest {
     pub schema: String,
     pub compilation: UniversalCapabilityCompilationRequest,
     pub receiver_profile: ReceiverProfile,
+    pub receiver_snapshot: ReceiverSnapshotBinding,
     pub capability_requirements: CapabilityRequirements,
     pub requested_strategy: MaterializationStrategy,
     pub affected_regions: Vec<crate::identity::TensorId>,
@@ -241,6 +243,19 @@ pub fn compile_and_plan_experimental_universal_capability(
     request
         .capability_requirements
         .validate_against(&request.compilation.capability_ir)?;
+    request
+        .receiver_snapshot
+        .validate_for(&request.receiver_profile)?;
+    if request
+        .compilation
+        .calibration
+        .receiver_snapshot_binding_sha256
+        != *request.receiver_snapshot.manifest_digest()
+    {
+        return Err(BrainError::Integrity(
+            "receiver_calibration_snapshot_binding_mismatch".into(),
+        ));
+    }
     if u64::try_from(
         compilation_receipt
             .compilation
@@ -451,6 +466,7 @@ mod tests {
             &ir,
             &operational,
             &ReceiverCalibrationSet {
+                receiver_snapshot_binding_sha256: Sha256Digest::zero(),
                 functional_signatures: functional.clone(),
                 receiver_solutions: functional
                     .iter()
@@ -495,6 +511,7 @@ mod tests {
             capability_ir: ir,
             operational_contract: operational,
             calibration: ReceiverCalibrationSet {
+                receiver_snapshot_binding_sha256: Sha256Digest::zero(),
                 functional_signatures: functional.clone(),
                 receiver_solutions: functional
                     .iter()

@@ -64,6 +64,9 @@ impl ReceiverCompilerPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ReceiverCalibrationSet {
+    /// Exact authenticated receiver snapshot for which solutions were measured.
+    /// Direct low-level experiments may use a draft marker, but planning rejects it.
+    pub receiver_snapshot_binding_sha256: crate::digest::Sha256Digest,
     pub functional_signatures: Vec<Vec<f64>>,
     pub receiver_solutions: Vec<Vec<f64>>,
     pub wrong_functional_signatures: Vec<Vec<f64>>,
@@ -672,6 +675,7 @@ mod tests {
             maximum_quadratic_cost: 1e6,
         };
         let calibration = ReceiverCalibrationSet {
+            receiver_snapshot_binding_sha256: crate::digest::Sha256Digest::zero(),
             functional_signatures: functional.clone(),
             receiver_solutions: receiver.clone(),
             wrong_functional_signatures: vec![functional[0].clone(), functional[2].clone()],
@@ -783,6 +787,7 @@ mod tests {
             maximum_quadratic_cost: 1e6,
         };
         let calibration = ReceiverCalibrationSet {
+            receiver_snapshot_binding_sha256: crate::digest::Sha256Digest::zero(),
             functional_signatures: functional.clone(),
             receiver_solutions: receiver.clone(),
             wrong_functional_signatures: vec![functional[0].clone()],

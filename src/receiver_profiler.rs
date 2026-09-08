@@ -22,6 +22,9 @@ pub struct ReceiverSnapshotBinding {
 }
 
 impl ReceiverSnapshotBinding {
+    pub fn manifest_digest(&self) -> &Sha256Digest {
+        &self.manifest_sha256
+    }
     pub fn create(
         profile: &ReceiverProfile,
         model_snapshot_sha256: Sha256Digest,
