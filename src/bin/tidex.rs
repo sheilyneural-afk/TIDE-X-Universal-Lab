@@ -7,6 +7,9 @@ use cerebro_tidex::identity::AcquisitionId;
 use cerebro_tidex::receiver_compiler::{
     benchmark_receiver_portability_leave_one_out, ReceiverPortabilityBenchmarkInput,
 };
+use cerebro_tidex::universal_capability_compiler::{
+    compile_experimental_universal_capability_request, UniversalCapabilityCompilationRequest,
+};
 use cerebro_tidex::workspace::{
     add_model, configured_tidex_home, create_workspace, current_workspace, load_model, use_model,
     use_workspace, ModelProfile, ModelProvider,
@@ -97,6 +100,12 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             let report = benchmark_receiver_portability_leave_one_out(&input)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        [area, command, path] if area == "compile" && command == "universal" => {
+            let request: UniversalCapabilityCompilationRequest =
+                read_json_bounded(Path::new(path))?;
+            let report = compile_experimental_universal_capability_request(&request)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
         [command] if command == "capabilities" => {
             let home = configured_tidex_home()?;
             let workspace = current_workspace(&home)?;
@@ -115,6 +124,7 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                         {"id":"transport.relational","status":"implemented","engine":"transport::learn_relational_transport"},
                         {"id":"compile.skill_fields","status":"implemented","engine":"parametric_program::compile_operator_to_fields"},
                         {"id":"compile.receiver","status":"implemented_experimental","engine":"receiver_compiler::compile_receiver_capability","evidence_status":"bounded_cross_model_experimental","reason":"receiver-native functional capability compilation is implemented with held-out functional verification, protection and trust-region gates; V66 adds one-seed cross-model evidence for Qwen2.5-Coder-1.5B -> SmolLM2-1.7B on MBPP using frozen-backbone LoRA materialization. This does not establish universal portability, zero-optimization translation, or generality across model and capability families"},
+                        {"id":"compile.universal_capability","status":"implemented_experimental","engine":"universal_capability_compiler::compile_experimental_universal_capability_request","reason":"versioned JSON request binds a verified source envelope, closed CapabilityIR, operational contract, receiver calibration, protection and risk controls. A passing result is experimental only and cannot authorize deployment or promotion"},
                         {"id":"benchmark.portability","canonical_name":"benchmark.receiver_compilation","status":"implemented","engine":"receiver_compiler::benchmark_receiver_portability_leave_one_out","reason":"leave-one-capability-out functional-space benchmark over declared calibration cases; the legacy portability id is retained for compatibility, while the benchmark measures receiver compilation recovery inside that domain and is not a universal cross-model claim"},
                         {"id":"runtime.sleep","status":"implemented","engine":"BrainEngine::sleep_cycle"},
                         {"id":"capability_ir.v63.contract","status":"implemented_foundation","engine":"capability_ir::OperationalCapabilityContract","reason":"StateIR anchors, repeated OperatorIR transitions, canonical transition signatures, closure and contraction verification are implemented; evidence is bounded to tested domains and does not establish a universal capability representation across arbitrary models or tasks"},
@@ -184,5 +194,5 @@ fn acquire_workspace(
 }
 
 fn usage() -> &'static str {
-    "usage:\n  tidex workspace create <name> --target <absolute-path>\n  tidex workspace use <name>\n  tidex workspace show\n  tidex model add <name> --provider openai-compatible --url <endpoint> --model <model>\n  tidex model use <name>\n  tidex acquire [--path <relative-project-path>]\n  tidex benchmark portability <input.json>\n  tidex capabilities"
+    "usage:\n  tidex workspace create <name> --target <absolute-path>\n  tidex workspace use <name>\n  tidex workspace show\n  tidex model add <name> --provider openai-compatible --url <endpoint> --model <model>\n  tidex model use <name>\n  tidex acquire [--path <relative-project-path>]\n  tidex benchmark portability <input.json>\n  tidex compile universal <input.json>\n  tidex capabilities"
 }

@@ -18,6 +18,23 @@ use crate::receiver_compiler::{
 };
 use serde::{Deserialize, Serialize};
 
+/// Portable input envelope for one experimental receiver compilation.
+///
+/// `risk_metric_rows` is used instead of serialising the internal matrix type.
+/// It must describe a finite square matrix with one row per receiver parameter.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct UniversalCapabilityCompilationRequest {
+    pub schema: String,
+    pub system_envelope: SystemEnvelope,
+    pub capability_ir: CapabilityIr,
+    pub operational_contract: OperationalCapabilityContract,
+    pub calibration: ReceiverCalibrationSet,
+    pub protected_cortex: ProtectedCortex,
+    pub risk_metric_rows: Vec<Vec<f64>>,
+    pub policy: ReceiverCompilerPolicy,
+}
+
 /// The only dispositions this experimental boundary can produce.
 ///
 /// `ExperimentalOnly` deliberately means that all local gates passed. It is
@@ -87,6 +104,35 @@ pub fn compile_experimental_universal_capability(
         receiver,
         disposition,
     })
+}
+
+/// Compile an independently serialised request.
+///
+/// This is the CLI and artifact boundary. It keeps the matrix wire format
+/// explicit and rejects malformed rows before the numerical compiler sees it.
+pub fn compile_experimental_universal_capability_request(
+    request: &UniversalCapabilityCompilationRequest,
+) -> BrainResult<UniversalCapabilityCompilation> {
+    if request.schema != "cerebro.tidex.universal_capability_compilation_request/v1" {
+        return Err(crate::error::BrainError::Invalid(
+            "universal_capability_compilation_request_schema".into(),
+        ));
+    }
+    let risk_metric = Matrix::from_rows(&request.risk_metric_rows)?;
+    if risk_metric.row_count() == 0 || risk_metric.row_count() != risk_metric.column_count() {
+        return Err(crate::error::BrainError::Invalid(
+            "universal_capability_compilation_risk_metric_shape".into(),
+        ));
+    }
+    compile_experimental_universal_capability(
+        &request.system_envelope,
+        &request.capability_ir,
+        &request.operational_contract,
+        &request.calibration,
+        &request.protected_cortex,
+        &risk_metric,
+        &request.policy,
+    )
 }
 
 #[cfg(test)]
@@ -258,6 +304,54 @@ mod tests {
             *envelope.manifest_sha256()
         );
         assert_eq!(compilation.capability_ir_sha256, *ir.manifest_digest());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn serialized_request_is_executable_and_rejects_a_nonsquare_risk_metric() {
+        let (root, envelope, ir, operational) = fixture();
+        let functional = calibration();
+        let request = UniversalCapabilityCompilationRequest {
+            schema: "cerebro.tidex.universal_capability_compilation_request/v1".into(),
+            system_envelope: envelope,
+            capability_ir: ir,
+            operational_contract: operational,
+            calibration: ReceiverCalibrationSet {
+                functional_signatures: functional.clone(),
+                receiver_solutions: functional
+                    .iter()
+                    .map(|row| receiver_solution(row))
+                    .collect(),
+                wrong_functional_signatures: vec![functional[0].clone(), functional[2].clone()],
+            },
+            protected_cortex: ProtectedCortex {
+                parameter_importance: vec![0.0; 5],
+                directions: Vec::new(),
+                max_damage_ratio: 0.01,
+            },
+            risk_metric_rows: (0..5)
+                .map(|row| (0..5).map(|column| f64::from(row == column)).collect())
+                .collect(),
+            policy: ReceiverCompilerPolicy {
+                schema: "cerebro.tidex.receiver_compiler_policy/v1".into(),
+                ridge: 1e-10,
+                minimum_decoder_loo_r2: 0.999,
+                minimum_encoder_loo_r2: 0.999,
+                minimum_decoder_loo_cosine: 0.999,
+                maximum_functional_relative_error: 1e-4,
+                minimum_identity_margin: 0.05,
+                maximum_quadratic_cost: 1e6,
+            },
+        };
+        let restored: UniversalCapabilityCompilationRequest =
+            serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+        assert!(compile_experimental_universal_capability_request(&restored)
+            .unwrap()
+            .is_experimentally_usable());
+
+        let mut malformed = restored;
+        malformed.risk_metric_rows.pop();
+        assert!(compile_experimental_universal_capability_request(&malformed).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }
