@@ -9,8 +9,8 @@
 use crate::acquisition_contract::SystemEnvelope;
 use crate::capability_ir::{CapabilityIr, OperationalCapabilityContract};
 use crate::contracts::ProtectedCortex;
-use crate::digest::{CapabilityIrDigest, SystemEnvelopeDigest};
-use crate::error::BrainResult;
+use crate::digest::{CapabilityIrDigest, Sha256Digest, SystemEnvelopeDigest};
+use crate::error::{BrainError, BrainResult};
 use crate::linalg::Matrix;
 use crate::receiver_compiler::{
     compile_receiver_capability, ReceiverCalibrationSet, ReceiverCompilation,
@@ -55,6 +55,15 @@ pub struct UniversalCapabilityCompilation {
     pub capability_ir_sha256: CapabilityIrDigest,
     pub receiver: ReceiverCompilation,
     pub disposition: UniversalCapabilityDisposition,
+}
+
+/// A replayable, request-bound record of one experimental compilation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct UniversalCapabilityCompilationReceipt {
+    pub schema: String,
+    pub request_sha256: Sha256Digest,
+    pub compilation: UniversalCapabilityCompilation,
 }
 
 impl UniversalCapabilityCompilation {
@@ -133,6 +142,48 @@ pub fn compile_experimental_universal_capability_request(
         &risk_metric,
         &request.policy,
     )
+}
+
+fn request_digest(request: &UniversalCapabilityCompilationRequest) -> BrainResult<Sha256Digest> {
+    let payload = serde_json::to_vec(request)?;
+    let mut framed = b"CEREBRO:TIDEX:UNIVERSAL-CAPABILITY-COMPILATION-REQUEST:v1\0".to_vec();
+    framed.extend_from_slice(&payload);
+    Ok(Sha256Digest::digest_bytes(&framed))
+}
+
+/// Execute a request and bind its exact wire representation to the result.
+pub fn execute_experimental_universal_capability_request(
+    request: &UniversalCapabilityCompilationRequest,
+) -> BrainResult<UniversalCapabilityCompilationReceipt> {
+    Ok(UniversalCapabilityCompilationReceipt {
+        schema: "cerebro.tidex.universal_capability_compilation_receipt/v1".into(),
+        request_sha256: request_digest(request)?,
+        compilation: compile_experimental_universal_capability_request(request)?,
+    })
+}
+
+/// Recompute a receipt from its request and fail closed on any divergence.
+pub fn replay_experimental_universal_capability_request(
+    request: &UniversalCapabilityCompilationRequest,
+    receipt: &UniversalCapabilityCompilationReceipt,
+) -> BrainResult<()> {
+    if receipt.schema != "cerebro.tidex.universal_capability_compilation_receipt/v1" {
+        return Err(BrainError::Invalid(
+            "universal_capability_compilation_receipt_schema".into(),
+        ));
+    }
+    if receipt.request_sha256 != request_digest(request)? {
+        return Err(BrainError::Integrity(
+            "universal_capability_compilation_request_digest_mismatch".into(),
+        ));
+    }
+    let replay = compile_experimental_universal_capability_request(request)?;
+    if replay != receipt.compilation {
+        return Err(BrainError::Integrity(
+            "universal_capability_compilation_replay_mismatch".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -348,6 +399,14 @@ mod tests {
         assert!(compile_experimental_universal_capability_request(&restored)
             .unwrap()
             .is_experimentally_usable());
+        let receipt = execute_experimental_universal_capability_request(&restored).unwrap();
+        replay_experimental_universal_capability_request(&restored, &receipt).unwrap();
+
+        let mut altered_receipt = receipt.clone();
+        altered_receipt.compilation.disposition = UniversalCapabilityDisposition::Rejected;
+        assert!(
+            replay_experimental_universal_capability_request(&restored, &altered_receipt).is_err()
+        );
 
         let mut malformed = restored;
         malformed.risk_metric_rows.pop();
