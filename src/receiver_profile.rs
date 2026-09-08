@@ -4,9 +4,10 @@
 //! every plan is shadow-only; no type in this module can write receiver
 //! parameters or activate a candidate.
 
-use crate::digest::Sha256Digest;
+use crate::capability_ir::CapabilityIr;
+use crate::digest::{CapabilityIrDigest, Sha256Digest};
 use crate::error::{BrainError, BrainResult};
-use crate::identity::{ArchitectureId, ModelId, TensorId};
+use crate::identity::{ArchitectureId, CapabilityId, ModelId, TensorId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -108,10 +109,27 @@ impl ReceiverProfile {
 #[serde(deny_unknown_fields)]
 pub struct CapabilityRequirements {
     pub schema: String,
+    pub capability_id: CapabilityId,
+    pub capability_ir_sha256: CapabilityIrDigest,
     pub required_modalities: BTreeSet<CapabilityModality>,
     pub requires_persistent_state: bool,
     pub minimum_receiver_parameter_dimension: u64,
     pub acceptable_strategies: BTreeSet<MaterializationStrategy>,
+}
+
+impl CapabilityRequirements {
+    pub fn validate_against(&self, ir: &CapabilityIr) -> BrainResult<()> {
+        if self.schema != "cerebro.tidex.capability_requirements/v1"
+            || self.capability_id != *ir.capability_id()
+            || self.capability_ir_sha256 != *ir.manifest_digest()
+            || self.acceptable_strategies.is_empty()
+        {
+            return Err(BrainError::Invalid(
+                "capability_requirements_invalid".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -203,6 +221,9 @@ pub enum PlanLifecycle {
 #[serde(deny_unknown_fields)]
 pub struct MaterializationPlan {
     pub schema: String,
+    pub capability_id: CapabilityId,
+    pub capability_ir_sha256: CapabilityIrDigest,
+    pub compilation_request_sha256: Sha256Digest,
     pub receiver_profile_sha256: Sha256Digest,
     pub strategy: MaterializationStrategy,
     pub affected_regions: Vec<TensorId>,
@@ -212,6 +233,8 @@ pub struct MaterializationPlan {
 pub fn create_shadow_plan(
     profile: &ReceiverProfile,
     assessment: &CompatibilityAssessment,
+    requirements: &CapabilityRequirements,
+    compilation_request_sha256: Sha256Digest,
     strategy: MaterializationStrategy,
     affected_regions: Vec<TensorId>,
 ) -> BrainResult<MaterializationPlan> {
@@ -235,6 +258,13 @@ pub fn create_shadow_plan(
         || affected_regions
             .iter()
             .any(|region| !declared.contains(region))
+        || affected_regions.iter().any(|region| {
+            !profile
+                .regions
+                .iter()
+                .find(|candidate| candidate.tensor_id == *region)
+                .is_some_and(|candidate| candidate.supported_strategies.contains(&strategy))
+        })
     {
         return Err(BrainError::Invalid(
             "materialization_plan_regions_invalid".into(),
@@ -242,6 +272,9 @@ pub fn create_shadow_plan(
     }
     Ok(MaterializationPlan {
         schema: "cerebro.tidex.materialization_plan/v1".into(),
+        capability_id: requirements.capability_id.clone(),
+        capability_ir_sha256: requirements.capability_ir_sha256.clone(),
+        compilation_request_sha256,
         receiver_profile_sha256: profile.digest()?,
         strategy,
         affected_regions,
@@ -276,6 +309,8 @@ mod tests {
         let profile = profile();
         let requirements = CapabilityRequirements {
             schema: "cerebro.tidex.capability_requirements/v1".into(),
+            capability_id: CapabilityId::parse("test.capability:v1").unwrap(),
+            capability_ir_sha256: CapabilityIrDigest::draft_marker(),
             required_modalities: BTreeSet::from([CapabilityModality::Text]),
             requires_persistent_state: false,
             minimum_receiver_parameter_dimension: 10,
@@ -286,6 +321,8 @@ mod tests {
         let plan = create_shadow_plan(
             &profile,
             &assessment,
+            &requirements,
+            Sha256Digest::zero(),
             MaterializationStrategy::LowRank,
             vec![TensorId::parse("layers.0.attn.q_proj.weight").unwrap()],
         )
@@ -296,6 +333,8 @@ mod tests {
     fn absent_modality_is_incompatible() {
         let requirements = CapabilityRequirements {
             schema: "cerebro.tidex.capability_requirements/v1".into(),
+            capability_id: CapabilityId::parse("test.capability:v1").unwrap(),
+            capability_ir_sha256: CapabilityIrDigest::draft_marker(),
             required_modalities: BTreeSet::from([CapabilityModality::Vision]),
             requires_persistent_state: false,
             minimum_receiver_parameter_dimension: 1,

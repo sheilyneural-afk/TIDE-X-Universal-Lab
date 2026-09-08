@@ -229,11 +229,29 @@ pub fn compile_and_plan_experimental_universal_capability(
             "universal_capability_compilation_not_usable".into(),
         ));
     }
+    request
+        .capability_requirements
+        .validate_against(&request.compilation.capability_ir)?;
+    if u64::try_from(
+        compilation_receipt
+            .compilation
+            .receiver
+            .receiver_parameter_dimension,
+    )
+    .map_err(|_| BrainError::Invalid("receiver_parameter_dimension_overflow".into()))?
+        != request.receiver_profile.parameter_dimension
+    {
+        return Err(BrainError::Integrity(
+            "receiver_profile_compilation_dimension_mismatch".into(),
+        ));
+    }
     let compatibility =
         assess_compatibility(&request.receiver_profile, &request.capability_requirements)?;
     let materialization_plan = create_shadow_plan(
         &request.receiver_profile,
         &compatibility,
+        &request.capability_requirements,
+        compilation_receipt.request_sha256.clone(),
         request.requested_strategy,
         request.affected_regions.clone(),
     )?;
