@@ -4,6 +4,7 @@
 //! accepts their resulting exact artifact commitments.  It never treats a
 //! human-readable model name as receiver identity.
 
+use crate::block_tomography::ParameterLayoutArtifact;
 use crate::digest::Sha256Digest;
 use crate::error::{BrainError, BrainResult};
 use crate::receiver_profile::ReceiverProfile;
@@ -86,4 +87,37 @@ impl ReceiverSnapshotBinding {
             })?,
         ))
     }
+}
+
+/// Verify that the reusable parameter-layout authority describes exactly the
+/// receiver regions committed by a snapshot. This is the geometry gate used
+/// before any structured shadow backend (dense, sparse, or low-rank) may
+/// interpret flat receiver coordinates as tensors.
+pub fn validate_receiver_parameter_layout(
+    profile: &ReceiverProfile,
+    snapshot: &ReceiverSnapshotBinding,
+    artifact: &ParameterLayoutArtifact,
+) -> BrainResult<()> {
+    snapshot.validate_for(profile)?;
+    artifact.validate()?;
+    if artifact.parameter_layout_sha256.as_digest() != &snapshot.parameter_layout_sha256
+        || artifact.total_parameter_count != profile.parameter_dimension
+        || artifact.layout.blocks.len() != profile.regions.len()
+    {
+        return Err(BrainError::Integrity(
+            "receiver_parameter_layout_binding_mismatch".into(),
+        ));
+    }
+    for (block, region) in artifact.layout.blocks.iter().zip(&profile.regions) {
+        if block.name != region.tensor_id.as_str()
+            || u64::try_from(block.count)
+                .map_err(|_| BrainError::Invalid("receiver_layout_count_overflow".into()))?
+                != region.parameter_count
+        {
+            return Err(BrainError::Integrity(
+                "receiver_parameter_layout_region_mismatch".into(),
+            ));
+        }
+    }
+    Ok(())
 }

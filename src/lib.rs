@@ -7,6 +7,7 @@ pub mod block_tomography;
 pub mod cognitive_field;
 pub mod confounders;
 pub mod contracts;
+pub mod dense_shadow_materializer;
 pub mod digest;
 pub mod dual_space;
 pub mod engine;

@@ -334,14 +334,20 @@ mod tests {
     use crate::acquisition_contract::{
         AcquisitionBudget, AcquisitionRequest, AcquisitionScope, NoisePolicy, RequestedResidency,
     };
+    use crate::block_tomography::{BlockShapeSpec, ParameterBlockLayout, ParameterLayoutArtifact};
     use crate::capability_ir::{
         IrNode, OperatorIrTransition, OutputBinding, PrimitiveSet, StateIrAnchor, TypedPort,
         ValueReference,
+    };
+    use crate::dense_shadow_materializer::{
+        load_dense_delta_shadow, materialize_replayed_dense_delta_shadow,
+        persist_dense_delta_shadow,
     };
     use crate::identity::{
         AcquisitionId, ArchitectureId, CapabilityId, CapabilityNodeId, ModelId, PortId,
         PrimitiveId, TensorId,
     };
+    use crate::lab_isolation::LabRoots;
     use crate::receiver_profile::{CapabilityModality, ReceiverArchitecture, ReceiverRegion};
     use crate::shadow_materializer::materialize_replayed_receiver_coordinates_shadow;
     use std::collections::BTreeSet;
@@ -568,6 +574,15 @@ mod tests {
     fn replayed_plan_materializes_only_the_compiler_target_delta() {
         let (root, envelope, ir, operational) = fixture();
         let functional = calibration();
+        let layout = ParameterLayoutArtifact::new(
+            ParameterBlockLayout::from_shapes(&[BlockShapeSpec {
+                name: "layers.0.receiver_coordinates".into(),
+                shape: vec![5],
+                count: 5,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
         let profile = ReceiverProfile {
             schema: "cerebro.tidex.receiver_profile/v1".into(),
             model_id: ModelId::parse("receiver.v1").unwrap(),
@@ -581,6 +596,7 @@ mod tests {
                 parameter_count: 5,
                 supported_strategies: BTreeSet::from([
                     MaterializationStrategy::ReceiverCoordinates,
+                    MaterializationStrategy::DenseDelta,
                 ]),
             }],
         };
@@ -589,7 +605,7 @@ mod tests {
             Sha256Digest::digest_bytes(b"model"),
             Sha256Digest::digest_bytes(b"config"),
             Sha256Digest::digest_bytes(b"tokenizer"),
-            Sha256Digest::digest_bytes(b"layout"),
+            layout.parameter_layout_sha256.as_digest().clone(),
         )
         .unwrap();
         let requirements = CapabilityRequirements {
@@ -599,7 +615,10 @@ mod tests {
             required_modalities: BTreeSet::from([CapabilityModality::Text]),
             requires_persistent_state: false,
             minimum_receiver_parameter_dimension: 5,
-            acceptable_strategies: BTreeSet::from([MaterializationStrategy::ReceiverCoordinates]),
+            acceptable_strategies: BTreeSet::from([
+                MaterializationStrategy::ReceiverCoordinates,
+                MaterializationStrategy::DenseDelta,
+            ]),
         };
         let request = UniversalCapabilityPlanningRequest {
             schema: "cerebro.tidex.universal_capability_planning_request/v1".into(),
@@ -663,6 +682,60 @@ mod tests {
             .receiver
             .target_delta[0] += 1.0;
         assert!(materialize_replayed_receiver_coordinates_shadow(&request, &tampered).is_err());
+
+        let mut dense_request = request;
+        dense_request.requested_strategy = MaterializationStrategy::DenseDelta;
+        let dense_receipt = execute_universal_capability_shadow_plan(&dense_request).unwrap();
+        let dense_candidate =
+            materialize_replayed_dense_delta_shadow(&dense_request, &dense_receipt, &layout)
+                .unwrap();
+        assert_eq!(dense_candidate.tensors.len(), 1);
+        assert_eq!(
+            dense_candidate.tensors[0].values,
+            dense_receipt
+                .shadow_plan
+                .compilation_receipt
+                .compilation
+                .receiver
+                .target_delta
+        );
+        let mut tampered_dense = dense_candidate.clone();
+        tampered_dense.tensors[0].values[0] += 1.0;
+        assert!(tampered_dense
+            .validate(&dense_request, &dense_receipt, &layout)
+            .is_err());
+
+        let mut wrong_layout = layout.clone();
+        wrong_layout.layout.blocks[0].shape = vec![1, 5];
+        assert!(materialize_replayed_dense_delta_shadow(
+            &dense_request,
+            &dense_receipt,
+            &wrong_layout
+        )
+        .is_err());
+
+        let lab = root.join("lab");
+        let state = lab.join("state");
+        let artifacts = lab.join("artifacts");
+        let production = root.join("production");
+        for directory in [&lab, &state, &artifacts, &production] {
+            fs::create_dir_all(directory).unwrap();
+            crate::security::secure_dir(directory).unwrap();
+        }
+        let roots = LabRoots::open_for_test(&lab, &state, &artifacts, &production).unwrap();
+        let reference = persist_dense_delta_shadow(
+            &roots,
+            &dense_request,
+            &dense_receipt,
+            &layout,
+            &dense_candidate,
+        )
+        .unwrap();
+        assert_eq!(
+            load_dense_delta_shadow(&roots, &dense_request, &dense_receipt, &layout, &reference,)
+                .unwrap(),
+            dense_candidate
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }
