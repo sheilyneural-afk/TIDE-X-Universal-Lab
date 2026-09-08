@@ -92,6 +92,15 @@ pub struct UniversalCapabilityShadowPlan {
     pub materialization_plan: MaterializationPlan,
 }
 
+/// A replayable record for the complete shadow-planning decision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct UniversalCapabilityShadowPlanReceipt {
+    pub schema: String,
+    pub planning_request_sha256: Sha256Digest,
+    pub shadow_plan: UniversalCapabilityShadowPlan,
+}
+
 impl UniversalCapabilityCompilation {
     pub fn is_experimentally_usable(&self) -> bool {
         self.disposition == UniversalCapabilityDisposition::ExperimentalOnly
@@ -261,6 +270,47 @@ pub fn compile_and_plan_experimental_universal_capability(
         compatibility,
         materialization_plan,
     })
+}
+
+fn planning_request_digest(
+    request: &UniversalCapabilityPlanningRequest,
+) -> BrainResult<Sha256Digest> {
+    Ok(Sha256Digest::digest_domain(
+        b"CEREBRO:TIDEX:UNIVERSAL-CAPABILITY-PLANNING-REQUEST:v1\0",
+        &serde_json::to_vec(request)?,
+    ))
+}
+
+pub fn execute_universal_capability_shadow_plan(
+    request: &UniversalCapabilityPlanningRequest,
+) -> BrainResult<UniversalCapabilityShadowPlanReceipt> {
+    Ok(UniversalCapabilityShadowPlanReceipt {
+        schema: "cerebro.tidex.universal_capability_shadow_plan_receipt/v1".into(),
+        planning_request_sha256: planning_request_digest(request)?,
+        shadow_plan: compile_and_plan_experimental_universal_capability(request)?,
+    })
+}
+
+pub fn replay_universal_capability_shadow_plan(
+    request: &UniversalCapabilityPlanningRequest,
+    receipt: &UniversalCapabilityShadowPlanReceipt,
+) -> BrainResult<()> {
+    if receipt.schema != "cerebro.tidex.universal_capability_shadow_plan_receipt/v1" {
+        return Err(BrainError::Invalid(
+            "universal_capability_shadow_plan_receipt_schema".into(),
+        ));
+    }
+    if receipt.planning_request_sha256 != planning_request_digest(request)? {
+        return Err(BrainError::Integrity(
+            "universal_capability_shadow_plan_request_digest_mismatch".into(),
+        ));
+    }
+    if receipt.shadow_plan != compile_and_plan_experimental_universal_capability(request)? {
+        return Err(BrainError::Integrity(
+            "universal_capability_shadow_plan_replay_mismatch".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
