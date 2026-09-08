@@ -1,0 +1,263 @@
+//! Experimental orchestration for receiver-native capability compilation.
+//!
+//! This module intentionally contains no donor-weight, adapter, LoRA, or task
+//! vector representation.  It binds the existing authenticated structural IR
+//! and operational contract to the existing receiver compiler.  Consequently
+//! a successful result is evidence only for the supplied calibration domain;
+//! it is never an automatic residency or promotion decision.
+
+use crate::acquisition_contract::SystemEnvelope;
+use crate::capability_ir::{CapabilityIr, OperationalCapabilityContract};
+use crate::contracts::ProtectedCortex;
+use crate::digest::{CapabilityIrDigest, SystemEnvelopeDigest};
+use crate::error::BrainResult;
+use crate::linalg::Matrix;
+use crate::receiver_compiler::{
+    compile_receiver_capability, ReceiverCalibrationSet, ReceiverCompilation,
+    ReceiverCompilerPolicy,
+};
+use serde::{Deserialize, Serialize};
+
+/// The only dispositions this experimental boundary can produce.
+///
+/// `ExperimentalOnly` deliberately means that all local gates passed. It is
+/// not a portability, equivalence, deployment, or promotion assertion.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UniversalCapabilityDisposition {
+    ExperimentalOnly,
+    Rejected,
+}
+
+/// A provenance-bound result from one receiver-native compilation attempt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct UniversalCapabilityCompilation {
+    pub schema: String,
+    pub source_envelope_sha256: SystemEnvelopeDigest,
+    pub capability_ir_sha256: CapabilityIrDigest,
+    pub receiver: ReceiverCompilation,
+    pub disposition: UniversalCapabilityDisposition,
+}
+
+impl UniversalCapabilityCompilation {
+    pub fn is_experimentally_usable(&self) -> bool {
+        self.disposition == UniversalCapabilityDisposition::ExperimentalOnly
+    }
+}
+
+/// Compile a sealed capability into receiver-native parameters for a declared
+/// experimental calibration domain.
+///
+/// The function accepts semantic representations and receiver calibration
+/// data, never donor parameters. It verifies the source envelope and IR chain
+/// before delegating all numerical, protected-subspace, trust-region, and
+/// operational checks to [`compile_receiver_capability`].
+pub fn compile_experimental_universal_capability(
+    envelope: &SystemEnvelope,
+    ir: &CapabilityIr,
+    operational: &OperationalCapabilityContract,
+    calibration: &ReceiverCalibrationSet,
+    protected_cortex: &ProtectedCortex,
+    risk_metric: &Matrix,
+    policy: &ReceiverCompilerPolicy,
+) -> BrainResult<UniversalCapabilityCompilation> {
+    envelope.verify_manifest()?;
+    ir.validate_against(envelope)?;
+    operational.validate_against(ir)?;
+
+    let receiver = compile_receiver_capability(
+        ir,
+        operational,
+        calibration,
+        protected_cortex,
+        risk_metric,
+        policy,
+    )?;
+    let disposition = if receiver.allowed && receiver.operational_verification.allowed {
+        UniversalCapabilityDisposition::ExperimentalOnly
+    } else {
+        UniversalCapabilityDisposition::Rejected
+    };
+
+    Ok(UniversalCapabilityCompilation {
+        schema: "cerebro.tidex.universal_capability_compilation/v1".into(),
+        source_envelope_sha256: envelope.manifest_sha256().clone(),
+        capability_ir_sha256: ir.manifest_digest().clone(),
+        receiver,
+        disposition,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acquisition_contract::{
+        AcquisitionBudget, AcquisitionRequest, AcquisitionScope, NoisePolicy, RequestedResidency,
+    };
+    use crate::capability_ir::{
+        IrNode, OperatorIrTransition, OutputBinding, PrimitiveSet, StateIrAnchor, TypedPort,
+        ValueReference,
+    };
+    use crate::identity::{AcquisitionId, CapabilityId, CapabilityNodeId, PortId, PrimitiveId};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn fixture() -> (
+        PathBuf,
+        SystemEnvelope,
+        CapabilityIr,
+        OperationalCapabilityContract,
+    ) {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tidex-ucc-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/capability.rs"), b"pub fn capability() {}\n").unwrap();
+        let request = AcquisitionRequest::new(
+            AcquisitionId::parse("ucc-fixture").unwrap(),
+            AcquisitionScope::WholeProject,
+            RequestedResidency::BestVerified,
+            NoisePolicy::ExplicitOnly,
+            AcquisitionBudget {
+                max_files: 8,
+                max_total_bytes: 1 << 20,
+            },
+            vec![],
+        )
+        .unwrap();
+        let envelope = SystemEnvelope::capture(&root, &request).unwrap();
+        let ir = CapabilityIr::new(
+            CapabilityId::parse("state.toggle:v1").unwrap(),
+            &envelope,
+            PrimitiveSet::tidex_core_v1().unwrap(),
+            vec![TypedPort::tensor_f64(PortId::parse("state").unwrap(), vec![2, 1]).unwrap()],
+            vec![IrNode::new(
+                CapabilityNodeId::parse("node.normalize").unwrap(),
+                PrimitiveId::parse("tensor.normalize").unwrap(),
+                vec![ValueReference::Input {
+                    name: PortId::parse("state").unwrap(),
+                }],
+                TypedPort::tensor_f64(PortId::parse("normalized").unwrap(), vec![2, 1]).unwrap(),
+                vec![PathBuf::from("src/capability.rs")],
+            )
+            .unwrap()],
+            vec![OutputBinding::new(
+                TypedPort::tensor_f64(PortId::parse("result").unwrap(), vec![2, 1]).unwrap(),
+                ValueReference::NodeOutput {
+                    node_id: CapabilityNodeId::parse("node.normalize").unwrap(),
+                },
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let pre = 2.0_f64.sqrt();
+        let operational = OperationalCapabilityContract {
+            schema: "cerebro.tidex.operational_capability/v1".into(),
+            capability_id: ir.capability_id().clone(),
+            capability_ir_sha256: ir.manifest_digest().clone(),
+            state_dimension: 2,
+            anchors: vec![
+                StateIrAnchor {
+                    anchor_id: "s0".into(),
+                    state: vec![1.0, 0.0],
+                },
+                StateIrAnchor {
+                    anchor_id: "s1".into(),
+                    state: vec![0.0, 1.0],
+                },
+            ],
+            transitions: vec![
+                OperatorIrTransition {
+                    operator_id: "toggle".into(),
+                    source_anchor_id: "s0".into(),
+                    target_anchor_id: "s1".into(),
+                    observed_next_state: vec![0.0, 1.0],
+                    pre_target_error: pre,
+                    post_target_error: 0.0,
+                },
+                OperatorIrTransition {
+                    operator_id: "toggle".into(),
+                    source_anchor_id: "s1".into(),
+                    target_anchor_id: "s0".into(),
+                    observed_next_state: vec![1.0, 0.0],
+                    pre_target_error: pre,
+                    post_target_error: 0.0,
+                },
+            ],
+            maximum_closure_error: 1e-5,
+            maximum_contraction_ratio: 1e-5,
+        };
+        (root, envelope, ir, operational)
+    }
+
+    fn calibration() -> Vec<Vec<f64>> {
+        vec![
+            vec![1.0, 0.0, 0.0, 1.0],
+            vec![1.0, 0.0, 1.0, 0.0],
+            vec![0.0, 1.0, 0.0, 1.0],
+            vec![1.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![1.0, 0.5, 0.5, 1.0],
+            vec![0.2, 1.0, 1.0, 0.2],
+            vec![1.2, -0.2, 0.4, 0.8],
+        ]
+    }
+
+    fn receiver_solution(functional: &[f64]) -> Vec<f64> {
+        vec![
+            2.0 * functional[0] + functional[1] - 0.5 * functional[2] + 0.1,
+            -functional[0] + 1.5 * functional[2] + functional[3] - 0.2,
+            0.5 * functional[1] + 2.0 * functional[3] + 0.3,
+            functional[0] - functional[1] + functional[2] - functional[3] + 0.4,
+            0.7 * functional[0] + 0.2 * functional[1] + 0.3 * functional[2] + 0.9 * functional[3]
+                - 0.1,
+        ]
+    }
+
+    #[test]
+    fn binds_existing_verified_components_without_donor_parameters() {
+        let (root, envelope, ir, operational) = fixture();
+        let functional = calibration();
+        let compilation = compile_experimental_universal_capability(
+            &envelope,
+            &ir,
+            &operational,
+            &ReceiverCalibrationSet {
+                functional_signatures: functional.clone(),
+                receiver_solutions: functional
+                    .iter()
+                    .map(|row| receiver_solution(row))
+                    .collect(),
+                wrong_functional_signatures: vec![functional[0].clone(), functional[2].clone()],
+            },
+            &ProtectedCortex {
+                parameter_importance: vec![0.0; 5],
+                directions: Vec::new(),
+                max_damage_ratio: 0.01,
+            },
+            &Matrix::identity(5),
+            &ReceiverCompilerPolicy {
+                schema: "cerebro.tidex.receiver_compiler_policy/v1".into(),
+                ridge: 1e-10,
+                minimum_decoder_loo_r2: 0.999,
+                minimum_encoder_loo_r2: 0.999,
+                minimum_decoder_loo_cosine: 0.999,
+                maximum_functional_relative_error: 1e-4,
+                minimum_identity_margin: 0.05,
+                maximum_quadratic_cost: 1e6,
+            },
+        )
+        .unwrap();
+        assert!(compilation.is_experimentally_usable(), "{compilation:#?}");
+        assert_eq!(
+            compilation.source_envelope_sha256,
+            *envelope.manifest_sha256()
+        );
+        assert_eq!(compilation.capability_ir_sha256, *ir.manifest_digest());
+        fs::remove_dir_all(root).unwrap();
+    }
+}

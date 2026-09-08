@@ -60,3 +60,4 @@ pub mod sleep_diagnostics;
 pub mod sleep_evidence;
 pub mod solver_portfolio;
 pub mod trust_region;
+pub mod universal_capability_compiler;
