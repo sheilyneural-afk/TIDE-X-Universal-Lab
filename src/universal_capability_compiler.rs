@@ -16,6 +16,10 @@ use crate::receiver_compiler::{
     compile_receiver_capability, ReceiverCalibrationSet, ReceiverCompilation,
     ReceiverCompilerPolicy,
 };
+use crate::receiver_profile::{
+    assess_compatibility, create_shadow_plan, CapabilityRequirements, CompatibilityAssessment,
+    MaterializationPlan, MaterializationStrategy, ReceiverProfile,
+};
 use serde::{Deserialize, Serialize};
 
 /// Portable input envelope for one experimental receiver compilation.
@@ -64,6 +68,28 @@ pub struct UniversalCapabilityCompilationReceipt {
     pub schema: String,
     pub request_sha256: Sha256Digest,
     pub compilation: UniversalCapabilityCompilation,
+}
+
+/// A non-actuating composition of compilation, compatibility assessment and
+/// materialization planning.  The resulting plan remains shadow-only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct UniversalCapabilityPlanningRequest {
+    pub schema: String,
+    pub compilation: UniversalCapabilityCompilationRequest,
+    pub receiver_profile: ReceiverProfile,
+    pub capability_requirements: CapabilityRequirements,
+    pub requested_strategy: MaterializationStrategy,
+    pub affected_regions: Vec<crate::identity::TensorId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct UniversalCapabilityShadowPlan {
+    pub schema: String,
+    pub compilation_receipt: UniversalCapabilityCompilationReceipt,
+    pub compatibility: CompatibilityAssessment,
+    pub materialization_plan: MaterializationPlan,
 }
 
 impl UniversalCapabilityCompilation {
@@ -184,6 +210,39 @@ pub fn replay_experimental_universal_capability_request(
         ));
     }
     Ok(())
+}
+
+/// Produce a complete shadow-only plan. Rejected compilations are never
+/// converted into plans, even if the receiver is otherwise compatible.
+pub fn compile_and_plan_experimental_universal_capability(
+    request: &UniversalCapabilityPlanningRequest,
+) -> BrainResult<UniversalCapabilityShadowPlan> {
+    if request.schema != "cerebro.tidex.universal_capability_planning_request/v1" {
+        return Err(BrainError::Invalid(
+            "universal_capability_planning_request_schema".into(),
+        ));
+    }
+    let compilation_receipt =
+        execute_experimental_universal_capability_request(&request.compilation)?;
+    if !compilation_receipt.compilation.is_experimentally_usable() {
+        return Err(BrainError::Integrity(
+            "universal_capability_compilation_not_usable".into(),
+        ));
+    }
+    let compatibility =
+        assess_compatibility(&request.receiver_profile, &request.capability_requirements)?;
+    let materialization_plan = create_shadow_plan(
+        &request.receiver_profile,
+        &compatibility,
+        request.requested_strategy,
+        request.affected_regions.clone(),
+    )?;
+    Ok(UniversalCapabilityShadowPlan {
+        schema: "cerebro.tidex.universal_capability_shadow_plan/v1".into(),
+        compilation_receipt,
+        compatibility,
+        materialization_plan,
+    })
 }
 
 #[cfg(test)]
