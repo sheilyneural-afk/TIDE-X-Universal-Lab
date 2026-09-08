@@ -230,6 +230,39 @@ pub struct MaterializationPlan {
     pub lifecycle: PlanLifecycle,
 }
 
+impl MaterializationPlan {
+    /// Re-admit a serialized plan against the exact receiver profile before a
+    /// backend consumes it. Plan construction is not treated as permanent
+    /// authority because persisted or transported bytes may be hostile.
+    pub fn validate_against_profile(&self, profile: &ReceiverProfile) -> BrainResult<()> {
+        profile.validate()?;
+        if self.schema != "cerebro.tidex.materialization_plan/v1"
+            || self.receiver_profile_sha256 != profile.digest()?
+            || self.lifecycle != PlanLifecycle::ShadowOnly
+            || self.affected_regions.is_empty()
+            || self
+                .affected_regions
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(BrainError::Invalid("materialization_plan_invalid".into()));
+        }
+        for affected in &self.affected_regions {
+            let region = profile
+                .regions
+                .iter()
+                .find(|candidate| candidate.tensor_id == *affected)
+                .ok_or_else(|| BrainError::Invalid("materialization_plan_region_unknown".into()))?;
+            if !region.supported_strategies.contains(&self.strategy) {
+                return Err(BrainError::Invalid(
+                    "materialization_plan_strategy_unsupported".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 pub fn create_shadow_plan(
     profile: &ReceiverProfile,
     assessment: &CompatibilityAssessment,
@@ -270,7 +303,7 @@ pub fn create_shadow_plan(
             "materialization_plan_regions_invalid".into(),
         ));
     }
-    Ok(MaterializationPlan {
+    let plan = MaterializationPlan {
         schema: "cerebro.tidex.materialization_plan/v1".into(),
         capability_id: requirements.capability_id.clone(),
         capability_ir_sha256: requirements.capability_ir_sha256.clone(),
@@ -279,7 +312,9 @@ pub fn create_shadow_plan(
         strategy,
         affected_regions,
         lifecycle: PlanLifecycle::ShadowOnly,
-    })
+    };
+    plan.validate_against_profile(profile)?;
+    Ok(plan)
 }
 
 #[cfg(test)]

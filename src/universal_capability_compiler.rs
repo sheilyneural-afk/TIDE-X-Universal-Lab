@@ -338,7 +338,13 @@ mod tests {
         IrNode, OperatorIrTransition, OutputBinding, PrimitiveSet, StateIrAnchor, TypedPort,
         ValueReference,
     };
-    use crate::identity::{AcquisitionId, CapabilityId, CapabilityNodeId, PortId, PrimitiveId};
+    use crate::identity::{
+        AcquisitionId, ArchitectureId, CapabilityId, CapabilityNodeId, ModelId, PortId,
+        PrimitiveId, TensorId,
+    };
+    use crate::receiver_profile::{CapabilityModality, ReceiverArchitecture, ReceiverRegion};
+    use crate::shadow_materializer::materialize_replayed_receiver_coordinates_shadow;
+    use std::collections::BTreeSet;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -555,6 +561,108 @@ mod tests {
         let mut malformed = restored;
         malformed.risk_metric_rows.pop();
         assert!(compile_experimental_universal_capability_request(&malformed).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replayed_plan_materializes_only_the_compiler_target_delta() {
+        let (root, envelope, ir, operational) = fixture();
+        let functional = calibration();
+        let profile = ReceiverProfile {
+            schema: "cerebro.tidex.receiver_profile/v1".into(),
+            model_id: ModelId::parse("receiver.v1").unwrap(),
+            architecture_id: ArchitectureId::parse("transformer.v1").unwrap(),
+            architecture: ReceiverArchitecture::Transformer,
+            modalities: BTreeSet::from([CapabilityModality::Text]),
+            supports_persistent_state: false,
+            parameter_dimension: 5,
+            regions: vec![ReceiverRegion {
+                tensor_id: TensorId::parse("layers.0.receiver_coordinates").unwrap(),
+                parameter_count: 5,
+                supported_strategies: BTreeSet::from([
+                    MaterializationStrategy::ReceiverCoordinates,
+                ]),
+            }],
+        };
+        let snapshot = ReceiverSnapshotBinding::create(
+            &profile,
+            Sha256Digest::digest_bytes(b"model"),
+            Sha256Digest::digest_bytes(b"config"),
+            Sha256Digest::digest_bytes(b"tokenizer"),
+            Sha256Digest::digest_bytes(b"layout"),
+        )
+        .unwrap();
+        let requirements = CapabilityRequirements {
+            schema: "cerebro.tidex.capability_requirements/v1".into(),
+            capability_id: ir.capability_id().clone(),
+            capability_ir_sha256: ir.manifest_digest().clone(),
+            required_modalities: BTreeSet::from([CapabilityModality::Text]),
+            requires_persistent_state: false,
+            minimum_receiver_parameter_dimension: 5,
+            acceptable_strategies: BTreeSet::from([MaterializationStrategy::ReceiverCoordinates]),
+        };
+        let request = UniversalCapabilityPlanningRequest {
+            schema: "cerebro.tidex.universal_capability_planning_request/v1".into(),
+            compilation: UniversalCapabilityCompilationRequest {
+                schema: "cerebro.tidex.universal_capability_compilation_request/v1".into(),
+                system_envelope: envelope,
+                capability_ir: ir,
+                operational_contract: operational,
+                calibration: ReceiverCalibrationSet {
+                    receiver_snapshot_binding_sha256: snapshot.manifest_digest().clone(),
+                    functional_signatures: functional.clone(),
+                    receiver_solutions: functional
+                        .iter()
+                        .map(|row| receiver_solution(row))
+                        .collect(),
+                    wrong_functional_signatures: vec![functional[0].clone(), functional[2].clone()],
+                },
+                protected_cortex: ProtectedCortex {
+                    parameter_importance: vec![0.0; 5],
+                    directions: Vec::new(),
+                    max_damage_ratio: 0.01,
+                },
+                risk_metric_rows: (0..5)
+                    .map(|row| (0..5).map(|column| f64::from(row == column)).collect())
+                    .collect(),
+                policy: ReceiverCompilerPolicy {
+                    schema: "cerebro.tidex.receiver_compiler_policy/v1".into(),
+                    ridge: 1e-10,
+                    minimum_decoder_loo_r2: 0.999,
+                    minimum_encoder_loo_r2: 0.999,
+                    minimum_decoder_loo_cosine: 0.999,
+                    maximum_functional_relative_error: 1e-4,
+                    minimum_identity_margin: 0.05,
+                    maximum_quadratic_cost: 1e6,
+                },
+            },
+            receiver_profile: profile,
+            receiver_snapshot: snapshot,
+            capability_requirements: requirements,
+            requested_strategy: MaterializationStrategy::ReceiverCoordinates,
+            affected_regions: vec![TensorId::parse("layers.0.receiver_coordinates").unwrap()],
+        };
+        let receipt = execute_universal_capability_shadow_plan(&request).unwrap();
+        let candidate =
+            materialize_replayed_receiver_coordinates_shadow(&request, &receipt).unwrap();
+        assert_eq!(
+            candidate.coordinates,
+            receipt
+                .shadow_plan
+                .compilation_receipt
+                .compilation
+                .receiver
+                .target_delta
+        );
+
+        let mut tampered = receipt;
+        tampered
+            .shadow_plan
+            .compilation_receipt
+            .compilation
+            .receiver
+            .target_delta[0] += 1.0;
+        assert!(materialize_replayed_receiver_coordinates_shadow(&request, &tampered).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }
