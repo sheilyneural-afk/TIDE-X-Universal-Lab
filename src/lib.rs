@@ -28,6 +28,7 @@ pub mod learning_orchestrator;
 pub mod ledger;
 pub mod linalg;
 pub mod low_rank_math;
+pub mod low_rank_shadow_materializer;
 pub mod parametric_program;
 pub mod persistent;
 pub mod portfolio_governance;
