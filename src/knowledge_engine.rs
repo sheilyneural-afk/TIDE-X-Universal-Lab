@@ -1251,6 +1251,12 @@ pub enum FormalEvidenceProtocol {
     ExternalCertificateV1,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyGraphEvidenceProtocol {
+    CanonicalDependencyEdgesV1,
+}
+
 struct EvidenceVerificationContext<'a> {
     private_root: &'a Path,
     authority_instance: &'a AuthorityInstanceId,
@@ -1736,6 +1742,71 @@ struct UntrustedFormalCertificateArtifactDto {
     certificate: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyGraphEvidenceArtifact {
+    binding: EvidenceAuthorityBinding,
+    protocol: DependencyGraphEvidenceProtocol,
+    root: DependencyNodeId,
+    depth: u16,
+    max_depth: u16,
+    edges: BTreeSet<DependencyEdge>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UntrustedDependencyGraphEvidenceArtifactDto {
+    binding: EvidenceAuthorityBinding,
+    protocol: DependencyGraphEvidenceProtocol,
+    root: DependencyNodeId,
+    depth: u16,
+    max_depth: u16,
+    edges: BTreeSet<DependencyEdge>,
+}
+
+impl DependencyGraphEvidenceArtifact {
+    pub fn from_invocation(
+        invocation: &CognitiveInvocation,
+        executor: &ExecutorIdentityDraft,
+        edges: BTreeSet<DependencyEdge>,
+    ) -> BrainResult<Self> {
+        let CognitiveInvocation::ExpandDependencyClosure(expansion) = invocation else {
+            return Err(invalid(
+                "dependency_graph_evidence_requires_dependency_invocation",
+            ));
+        };
+        Ok(Self {
+            binding: EvidenceAuthorityBinding::from_invocation(invocation, executor)?,
+            protocol: DependencyGraphEvidenceProtocol::CanonicalDependencyEdgesV1,
+            root: expansion.root.clone(),
+            depth: expansion.depth,
+            max_depth: expansion.max_depth,
+            edges,
+        })
+    }
+
+    pub fn canonical_bytes(&self) -> BrainResult<Vec<u8>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    fn decode_canonical(bytes: &[u8]) -> BrainResult<Self> {
+        let dto: UntrustedDependencyGraphEvidenceArtifactDto = serde_json::from_slice(bytes)
+            .map_err(|_| integrity("dependency_graph_evidence_encoding_invalid"))?;
+        let artifact = Self {
+            binding: dto.binding,
+            protocol: dto.protocol,
+            root: dto.root,
+            depth: dto.depth,
+            max_depth: dto.max_depth,
+            edges: dto.edges,
+        };
+        if artifact.canonical_bytes()? != bytes {
+            return Err(integrity("dependency_graph_evidence_not_canonical"));
+        }
+        Ok(artifact)
+    }
+}
+
 fn calculate_executor_version_digest(
     executor_id: &ExecutorId,
     interface_version: ExecutorInterfaceVersion,
@@ -1760,6 +1831,32 @@ fn canonical_completed(observations: BTreeMap<ObservationKey, ObservedValue>) ->
         dependency_edges: BTreeSet::new(),
         discovered_obligations: BTreeMap::new(),
     }
+}
+
+fn observation_for_predicate(predicate: &KnowledgePredicate) -> ObservedValue {
+    match predicate {
+        KnowledgePredicate::BoolEquals { expected, .. } => ObservedValue::Bool(*expected),
+        KnowledgePredicate::I64Equals { expected, .. } => ObservedValue::I64(*expected),
+        KnowledgePredicate::U64Equals { expected, .. } => ObservedValue::U64(*expected),
+        KnowledgePredicate::U64AtLeast { minimum, .. } => ObservedValue::U64(*minimum),
+        KnowledgePredicate::U64AtMost { maximum, .. } => ObservedValue::U64(*maximum),
+        KnowledgePredicate::SymbolEquals { expected, .. } => {
+            ObservedValue::Symbol(expected.clone())
+        }
+        KnowledgePredicate::ExactBytesDigestEquals { expected, .. } => {
+            ObservedValue::ExactBytesDigest(expected.clone())
+        }
+    }
+}
+
+fn canonical_dependency_closure_observations(
+    invocation: &DependencyExpansionInvocation,
+) -> BTreeMap<ObservationKey, ObservedValue> {
+    let predicate = invocation.binding.criterion.predicate();
+    BTreeMap::from_iter(std::iter::once((
+        predicate.observation_key().clone(),
+        observation_for_predicate(predicate),
+    )))
 }
 
 fn validate_exact_observation_keys(
@@ -1848,7 +1945,12 @@ impl EvidenceVerifierRegistry {
                 "completed_evidence_derivation_requires_completed_outcome",
             ));
         };
-        if !dependency_edges.is_empty() || !discovered_obligations.is_empty() {
+        if !discovered_obligations.is_empty()
+            || (!matches!(
+                context.invocation,
+                CognitiveInvocation::ExpandDependencyClosure(_)
+            ) && !dependency_edges.is_empty())
+        {
             return Err(integrity(
                 "semantic_verifier_forbids_unverified_derivations",
             ));
@@ -1871,7 +1973,7 @@ impl EvidenceVerifierRegistry {
                 return self.reject_unchecked_formal_certificate(context, formal, evidence);
             }
             CognitiveInvocation::ExpandDependencyClosure(_) => {
-                return Err(integrity("dependency_evidence_verifier_not_implemented"));
+                self.derive_dependency_graph(context, evidence)?
             }
         };
         if derived != *proposed {
@@ -2069,6 +2171,44 @@ impl EvidenceVerifierRegistry {
         let observations = first_counterexample
             .ok_or_else(|| integrity("counterexample_evidence_contains_no_counterexample"))?;
         Ok(canonical_completed(observations))
+    }
+
+    fn derive_dependency_graph(
+        &self,
+        context: &EvidenceVerificationContext<'_>,
+        evidence: &[EvidenceArtifactInput],
+    ) -> BrainResult<ActionOutcome> {
+        let bytes = read_single_evidence(
+            context.private_root,
+            evidence,
+            EvidenceKind::DependencyGraph,
+            "dependency_graph_evidence_cardinality_or_kind_invalid",
+        )?;
+        let artifact = DependencyGraphEvidenceArtifact::decode_canonical(&bytes)?;
+        artifact.binding.validate(context)?;
+        let CognitiveInvocation::ExpandDependencyClosure(expansion) = context.invocation else {
+            return Err(integrity(
+                "dependency_graph_verifier_requires_dependency_invocation",
+            ));
+        };
+        if artifact.protocol != DependencyGraphEvidenceProtocol::CanonicalDependencyEdgesV1
+            || artifact.root != expansion.root
+            || artifact.depth != expansion.depth
+            || artifact.max_depth != expansion.max_depth
+            || artifact
+                .edges
+                .iter()
+                .any(|edge| edge.from() != &expansion.root)
+        {
+            return Err(integrity(
+                "dependency_graph_evidence_protocol_or_inputs_mismatch",
+            ));
+        }
+        Ok(ActionOutcome::Completed {
+            observations: canonical_dependency_closure_observations(expansion),
+            dependency_edges: artifact.edges,
+            discovered_obligations: BTreeMap::new(),
+        })
     }
 
     fn derive_formal_backend_unavailable(
@@ -6271,6 +6411,143 @@ mod tests {
             .evidence_verifiers
             .derive_completed(&foreign_context, &proposed, &evidence)
             .is_err());
+    }
+
+    #[test]
+    fn dependency_graph_verifier_derives_typed_edges() {
+        let mut fixture = fixture();
+        let state = initialize(
+            &fixture,
+            "dependency.graph.verifier.inquiry.v1",
+            dependency_contract("component.root"),
+        );
+        let invocation = planned_invocation(&fixture.engine, &state);
+        let CognitiveInvocation::ExpandDependencyClosure(expansion) = &invocation else {
+            panic!("expected dependency expansion invocation");
+        };
+        let executor = fixture
+            .engine
+            .authenticate_executor(fixture.executor.clone())
+            .unwrap();
+        let edge = DependencyEdge::new(
+            expansion.root.clone(),
+            DependencyNodeId::parse("component.child").unwrap(),
+        );
+        let artifact = DependencyGraphEvidenceArtifact::from_invocation(
+            &invocation,
+            &fixture.executor,
+            BTreeSet::from([edge.clone()]),
+        )
+        .unwrap();
+        let observations = canonical_dependency_closure_observations(expansion);
+        let proposed = ActionOutcome::Completed {
+            observations,
+            dependency_edges: BTreeSet::from([edge.clone()]),
+            discovered_obligations: BTreeMap::new(),
+        };
+        let evidence = evidence_input(
+            &mut fixture,
+            EvidenceKind::DependencyGraph,
+            artifact.canonical_bytes().unwrap(),
+        );
+        assert_eq!(
+            fixture
+                .engine
+                .evidence_verifiers
+                .derive_completed(
+                    &verification_context(&fixture.engine, &invocation, &executor),
+                    &proposed,
+                    std::slice::from_ref(&evidence),
+                )
+                .unwrap(),
+            proposed
+        );
+
+        let tampered = UntrustedDependencyGraphEvidenceArtifactDto {
+            binding: artifact.binding,
+            protocol: DependencyGraphEvidenceProtocol::CanonicalDependencyEdgesV1,
+            root: DependencyNodeId::parse("component.foreign.root").unwrap(),
+            depth: expansion.depth,
+            max_depth: expansion.max_depth,
+            edges: artifact.edges,
+        };
+        let invalid_tampered_root = evidence_input(
+            &mut fixture,
+            EvidenceKind::DependencyGraph,
+            serde_json::to_vec(&tampered).unwrap(),
+        );
+        assert!(fixture
+            .engine
+            .evidence_verifiers
+            .derive_completed(
+                &verification_context(&fixture.engine, &invocation, &executor),
+                &proposed,
+                std::slice::from_ref(&invalid_tampered_root),
+            )
+            .is_err());
+
+        let foreign_engine = KnowledgeEngine::from_verified_root(
+            fixture.root.clone(),
+            AuthorityInstanceId::parse("foreign-dependency-authority.v1").unwrap(),
+        )
+        .unwrap();
+        let foreign_executor = foreign_engine
+            .authenticate_executor(fixture.executor.clone())
+            .unwrap();
+        assert!(foreign_engine
+            .evidence_verifiers
+            .derive_completed(
+                &verification_context(&foreign_engine, &invocation, &foreign_executor),
+                &proposed,
+                std::slice::from_ref(&evidence),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn dependency_graph_verifier_drives_real_advance_with_dependency_evidence() {
+        let mut fixture = fixture();
+        let state = initialize(
+            &fixture,
+            "dependency.graph.advance.inquiry.v1",
+            dependency_contract("component.root"),
+        );
+        fixture.engine.persist_state(&state).unwrap();
+        let invocation = planned_invocation(&fixture.engine, &state);
+        let edge = DependencyEdge::new(
+            DependencyNodeId::parse("component.root").unwrap(),
+            DependencyNodeId::parse("component.child").unwrap(),
+        );
+        let artifact = DependencyGraphEvidenceArtifact::from_invocation(
+            &invocation,
+            &fixture.executor,
+            BTreeSet::from([edge.clone()]),
+        )
+        .unwrap();
+        let observations = canonical_dependency_closure_observations(match &invocation {
+            CognitiveInvocation::ExpandDependencyClosure(expansion) => expansion,
+            _ => unreachable!(),
+        });
+        let evidence = evidence_input(
+            &mut fixture,
+            EvidenceKind::DependencyGraph,
+            artifact.canonical_bytes().unwrap(),
+        );
+        let adapter = ProductionEvidenceAdapter {
+            identity: fixture.executor.clone(),
+            expected_invocation: invocation.digest().unwrap(),
+            execution: AdapterExecution::new(
+                ActionOutcome::Completed {
+                    observations,
+                    dependency_edges: BTreeSet::from([edge.clone()]),
+                    discovered_obligations: BTreeMap::new(),
+                },
+                vec![evidence],
+            ),
+        };
+        let receipt = fixture.engine.execute(&state, &adapter).unwrap();
+        let advanced = fixture.engine.advance(&state, &receipt).unwrap();
+        assert!(advanced.state().claims().len() >= 2);
     }
 
     #[test]

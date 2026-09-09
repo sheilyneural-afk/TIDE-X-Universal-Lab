@@ -63,6 +63,14 @@ name = "pure-linear-runner"
 path = "src/bin/pure_linear_runner.rs"
 
 [[bin]]
+name = "universal-shadow-runner"
+path = "src/bin/universal_shadow_runner.rs"
+
+[[bin]]
+name = "prepare-universal-lab-run"
+path = "src/bin/prepare_universal_lab_run.rs"
+
+[[bin]]
 name = "record-representation-evidence"
 path = "src/bin/record_representation_evidence.rs"
 

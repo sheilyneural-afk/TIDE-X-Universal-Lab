@@ -10,17 +10,20 @@ use cerebro_tidex::capability_discovery::CapabilityDiscoveryRequest;
 use cerebro_tidex::checkpoint_adapter::{inspect_safetensors_receiver, SafeTensorsReceiverRequest};
 use cerebro_tidex::content_vault::capture_to_vault;
 use cerebro_tidex::dense_shadow_materializer::materialize_replayed_dense_delta_shadow;
+use cerebro_tidex::digest::Sha256Digest;
 use cerebro_tidex::identity::AcquisitionId;
 use cerebro_tidex::isolated_execution::AuthenticatedBytes;
 use cerebro_tidex::low_rank_shadow_materializer::{
     materialize_replayed_low_rank_shadow, LowRankShadowPolicy,
 };
-use cerebro_tidex::materialization_selector::BackendSelectionInput;
+use cerebro_tidex::materialization_selector::{BackendSelectionInput, BackendSelectionPolicy};
 use cerebro_tidex::receiver_compiler::{
     benchmark_receiver_portability_leave_one_out, ReceiverPortabilityBenchmarkInput,
 };
 use cerebro_tidex::receiver_layout::ReceiverMaterializationLayout;
-use cerebro_tidex::shadow_evaluation::{run_shadow_evaluation, ShadowEvaluationInput};
+use cerebro_tidex::shadow_evaluation::{
+    run_shadow_evaluation, ShadowEvaluationInput, ShadowEvaluationReceipt,
+};
 use cerebro_tidex::sparse_shadow_materializer::{
     materialize_replayed_sparse_shadow, SparseShadowPolicy,
 };
@@ -31,14 +34,14 @@ use cerebro_tidex::universal_capability_compiler::{
     UniversalCapabilityPlanningRequest, UniversalCapabilityShadowPlanReceipt,
 };
 use cerebro_tidex::universal_promotion_gate::{
-    evaluate_universal_promotion_gate, UniversalPromotionGateRequest,
+    evaluate_universal_promotion_gate, UniversalPromotionGateRequest, UniversalPromotionPolicy,
 };
 use cerebro_tidex::universality_evidence::UniversalityEvidenceInput;
 use cerebro_tidex::workspace::{
     add_model, configured_tidex_home, create_workspace, current_workspace, load_model, use_model,
     use_workspace, ModelProfile, ModelProvider,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -54,6 +57,34 @@ fn main() {
 
 fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     match args.as_slice() {
+        [area, command, model_root, receiver_request, discovery_request, planning_request, backend, layout_path, backend_policy_path, steering_layout_path, runner, shadow_input, selection_input, universality_input, promotion_input, output_dir]
+            if area == "lab" && command == "e2e" =>
+        {
+            run_lab_e2e(&LabE2EInvocation {
+                model_root: Path::new(model_root),
+                receiver_request_path: Path::new(receiver_request),
+                discovery_request_path: Path::new(discovery_request),
+                planning_request_path: Path::new(planning_request),
+                backend,
+                layout_path: Path::new(layout_path),
+                backend_policy_path: if backend_policy_path == "-" {
+                    None
+                } else {
+                    Some(Path::new(backend_policy_path))
+                },
+                steering_layout_path: if steering_layout_path == "-" {
+                    None
+                } else {
+                    Some(Path::new(steering_layout_path))
+                },
+                runner_path: Path::new(runner),
+                shadow_input_path: Path::new(shadow_input),
+                selection_input_path: Path::new(selection_input),
+                universality_input_path: Path::new(universality_input),
+                promotion_input_path: Path::new(promotion_input),
+                output_dir: Path::new(output_dir),
+            })?;
+        }
         [area, command, name, flag, target]
             if area == "workspace" && command == "create" && flag == "--target" =>
         {
@@ -328,6 +359,23 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+struct LabE2EInvocation<'a> {
+    model_root: &'a Path,
+    receiver_request_path: &'a Path,
+    discovery_request_path: &'a Path,
+    planning_request_path: &'a Path,
+    backend: &'a str,
+    layout_path: &'a Path,
+    backend_policy_path: Option<&'a Path>,
+    steering_layout_path: Option<&'a Path>,
+    runner_path: &'a Path,
+    shadow_input_path: &'a Path,
+    selection_input_path: &'a Path,
+    universality_input_path: &'a Path,
+    promotion_input_path: &'a Path,
+    output_dir: &'a Path,
+}
+
 fn read_json_bounded<T: serde::de::DeserializeOwned>(
     path: &Path,
 ) -> Result<T, Box<dyn std::error::Error>> {
@@ -339,6 +387,405 @@ fn read_json_bounded<T: serde::de::DeserializeOwned>(
         return Err("tidex_benchmark_input_too_large".into());
     }
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn write_json_output<T: serde::Serialize>(
+    path: &Path,
+    value: &T,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(value)?;
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+fn digest_field(value: &Value, field: &str) -> Result<Sha256Digest, Box<dyn std::error::Error>> {
+    serde_json::from_value(
+        value
+            .get(field)
+            .ok_or_else(|| format!("missing digest field: {field}"))?
+            .clone(),
+    )
+    .map_err(Into::into)
+}
+
+fn read_or_build_backend_selection_input(
+    path: &Path,
+    shadow_evaluations: &[ShadowEvaluationReceipt],
+) -> Result<BackendSelectionInput, Box<dyn std::error::Error>> {
+    let value: Value = read_json_bounded(path)?;
+    match value.get("schema").and_then(Value::as_str) {
+        Some("cerebro.tidex.backend_selection_input/v1") => {
+            Ok(serde_json::from_value::<BackendSelectionInput>(value)?)
+        }
+        Some("cerebro.tidex.backend_selection_policy/v1") => {
+            if shadow_evaluations.is_empty() {
+                return Err(
+                    "backend selection policy requires at least one shadow evaluation".into(),
+                );
+            }
+            Ok(BackendSelectionInput {
+                schema: "cerebro.tidex.backend_selection_input/v1".into(),
+                evaluations: shadow_evaluations
+                    .iter()
+                    .map(|receipt| receipt.evaluation.clone())
+                    .collect(),
+                complementarity: vec![],
+                policy: serde_json::from_value::<BackendSelectionPolicy>(value)?,
+            })
+        }
+        _ => Err("backend selection file schema invalid".into()),
+    }
+}
+
+fn read_or_build_promotion_gate_request(
+    path: &Path,
+    selection_input: &BackendSelectionInput,
+    selection_receipt: &cerebro_tidex::materialization_selector::BackendSelectionReceipt,
+    universality_input: &UniversalityEvidenceInput,
+    universality_receipt: &cerebro_tidex::universality_evidence::UniversalityEvidenceReceipt,
+    shadow_evaluations: &[ShadowEvaluationReceipt],
+) -> Result<UniversalPromotionGateRequest, Box<dyn std::error::Error>> {
+    let value: Value = read_json_bounded(path)?;
+    match value.get("schema").and_then(Value::as_str) {
+        Some("cerebro.tidex.universal_promotion_gate_request/v1") => Ok(serde_json::from_value::<
+            UniversalPromotionGateRequest,
+        >(value)?),
+        Some("cerebro.tidex.universal_promotion_policy/v1") => Ok(UniversalPromotionGateRequest {
+            schema: "cerebro.tidex.universal_promotion_gate_request/v1".into(),
+            selection_input: selection_input.clone(),
+            selection_receipt: selection_receipt.clone(),
+            universality_input: universality_input.clone(),
+            universality_receipt: universality_receipt.clone(),
+            shadow_evaluations: shadow_evaluations.to_vec(),
+            policy: serde_json::from_value::<UniversalPromotionPolicy>(value)?,
+        }),
+        _ => Err("promotion gate file schema invalid".into()),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LabBackend {
+    Dense,
+    LowRank,
+    Sparse,
+    Steering,
+}
+
+impl LabBackend {
+    fn parse(value: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        match value {
+            "dense" => Ok(Self::Dense),
+            "low-rank" => Ok(Self::LowRank),
+            "sparse" => Ok(Self::Sparse),
+            "steering" => Ok(Self::Steering),
+            _ => Err("invalid lab backend".into()),
+        }
+    }
+
+    fn into_strategy(self) -> cerebro_tidex::receiver_profile::MaterializationStrategy {
+        match self {
+            Self::Dense => cerebro_tidex::receiver_profile::MaterializationStrategy::DenseDelta,
+            Self::LowRank => cerebro_tidex::receiver_profile::MaterializationStrategy::LowRank,
+            Self::Sparse => cerebro_tidex::receiver_profile::MaterializationStrategy::SparseDelta,
+            Self::Steering => {
+                cerebro_tidex::receiver_profile::MaterializationStrategy::ActivationSteering
+            }
+        }
+    }
+}
+
+fn default_low_rank_policy() -> LowRankShadowPolicy {
+    LowRankShadowPolicy {
+        schema: "cerebro.tidex.low_rank_shadow_policy/v1".into(),
+        maximum_rank: 4,
+        relative_reconstruction_tolerance: 0.04,
+        absolute_reconstruction_tolerance: 0.02,
+        minimum_parameter_reduction_ratio: 0.20,
+        maximum_svd_sweeps: 128,
+    }
+}
+
+fn default_sparse_policy() -> SparseShadowPolicy {
+    SparseShadowPolicy {
+        schema: "cerebro.tidex.sparse_shadow_policy/v1".into(),
+        maximum_nonzero_count: 1024,
+        maximum_density: 0.02,
+        absolute_zero_threshold: 1.0e-8,
+        relative_reconstruction_tolerance: 0.025,
+        absolute_reconstruction_tolerance: 0.015,
+        minimum_storage_reduction_ratio: 0.20,
+    }
+}
+
+fn run_lab_e2e(invocation: &LabE2EInvocation<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    let backend = LabBackend::parse(invocation.backend)?;
+    fs::create_dir_all(invocation.output_dir)?;
+
+    let generated_dir = invocation.output_dir.join(".generated");
+    fs::create_dir_all(&generated_dir)?;
+
+    for path in [
+        invocation.receiver_request_path,
+        invocation.discovery_request_path,
+        invocation.planning_request_path,
+        invocation.layout_path,
+        invocation.runner_path,
+        invocation.shadow_input_path,
+        invocation.selection_input_path,
+        invocation.universality_input_path,
+        invocation.promotion_input_path,
+    ] {
+        if !path.exists() {
+            return Err("input file not found".into());
+        }
+    }
+
+    let backend_policy_path = invocation
+        .backend_policy_path
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            if backend == LabBackend::LowRank {
+                let path = generated_dir.join("generated-low-rank-policy.json");
+                write_json_output(&path, &default_low_rank_policy()).ok()?;
+                Some(path)
+            } else if backend == LabBackend::Sparse {
+                let path = generated_dir.join("generated-sparse-policy.json");
+                write_json_output(&path, &default_sparse_policy()).ok()?;
+                Some(path)
+            } else {
+                None
+            }
+        });
+    let steering_layout_path = invocation.steering_layout_path.map(Path::to_path_buf);
+
+    match backend {
+        LabBackend::Dense => {
+            if invocation.backend_policy_path.is_some() {
+                return Err("dense backend does not use backend policy".into());
+            }
+            if invocation.steering_layout_path.is_some() {
+                return Err("dense backend does not use steering layout".into());
+            }
+        }
+        LabBackend::Steering => {
+            if !steering_layout_path.as_deref().is_some_and(Path::exists) {
+                return Err("steering layout file not found".into());
+            }
+            if backend_policy_path.is_none() {
+                return Err("steering backend requires policy path".into());
+            }
+        }
+        LabBackend::LowRank => {
+            if !backend_policy_path.as_deref().is_some_and(Path::exists) {
+                return Err("low-rank policy file not found".into());
+            }
+        }
+        LabBackend::Sparse => {
+            if !backend_policy_path.as_deref().is_some_and(Path::exists) {
+                return Err("sparse policy file not found".into());
+            }
+        }
+    }
+
+    let receiver_request: SafeTensorsReceiverRequest =
+        read_json_bounded(invocation.receiver_request_path)?;
+    let receiver_profile = inspect_safetensors_receiver(invocation.model_root, &receiver_request)?;
+    write_json_output(
+        &invocation.output_dir.join("01-receiver-profile.json"),
+        &receiver_profile,
+    )?;
+
+    let discovery_request: CapabilityDiscoveryRequest =
+        read_json_bounded(invocation.discovery_request_path)?;
+    if discovery_request.architecture_fingerprint != receiver_profile.architecture_fingerprint {
+        return Err("discovery request does not match inspected receiver architecture".into());
+    }
+    let discovery_report = discovery_request.execute()?;
+    write_json_output(
+        &invocation.output_dir.join("02-discovery-report.json"),
+        &discovery_report,
+    )?;
+
+    let planning_request: UniversalCapabilityPlanningRequest =
+        read_json_bounded(invocation.planning_request_path)?;
+    if planning_request.receiver_profile != receiver_profile.profile {
+        return Err("planning request receiver profile does not match inspected receiver".into());
+    }
+    if planning_request.receiver_snapshot != receiver_profile.snapshot {
+        return Err("planning request receiver snapshot does not match inspected receiver".into());
+    }
+    let planning_receipt = execute_universal_capability_shadow_plan(&planning_request)?;
+    write_json_output(
+        &invocation.output_dir.join("03-shadow-plan.json"),
+        &planning_receipt,
+    )?;
+
+    replay_universal_capability_shadow_plan(&planning_request, &planning_receipt)?;
+    write_json_output(
+        &invocation.output_dir.join("04-shadow-plan-replay.json"),
+        &json!({
+            "schema": "cerebro.tidex.universal_shadow_plan_replay/v1",
+            "planning_request_sha256": planning_receipt.planning_request_sha256,
+            "replayed": true,
+        }),
+    )?;
+
+    let layout: ReceiverMaterializationLayout = read_json_bounded(invocation.layout_path)?;
+    if layout != receiver_profile.layout {
+        return Err("materialization layout does not match inspected receiver layout".into());
+    }
+    let materialization_candidate: Value = match backend {
+        LabBackend::Dense => serde_json::to_value(materialize_replayed_dense_delta_shadow(
+            &planning_request,
+            &planning_receipt,
+            &layout,
+        )?)?,
+        LabBackend::LowRank => {
+            let policy_path = backend_policy_path
+                .as_deref()
+                .ok_or("low-rank policy missing")?;
+            let policy: LowRankShadowPolicy = read_json_bounded(policy_path)?;
+            serde_json::to_value(materialize_replayed_low_rank_shadow(
+                &planning_request,
+                &planning_receipt,
+                &layout,
+                &policy,
+            )?)?
+        }
+        LabBackend::Sparse => {
+            let policy_path = backend_policy_path
+                .as_deref()
+                .ok_or("sparse policy missing")?;
+            let policy: SparseShadowPolicy = read_json_bounded(policy_path)?;
+            serde_json::to_value(materialize_replayed_sparse_shadow(
+                &planning_request,
+                &planning_receipt,
+                &layout,
+                &policy,
+            )?)?
+        }
+        LabBackend::Steering => {
+            let policy_path = backend_policy_path
+                .as_deref()
+                .ok_or("steering policy missing")?;
+            let steering_layout: ActivationSteeringLayout = read_json_bounded(
+                steering_layout_path
+                    .as_deref()
+                    .ok_or("steering layout missing")?,
+            )?;
+            let policy: ActivationSteeringPolicy = read_json_bounded(policy_path)?;
+            serde_json::to_value(materialize_replayed_activation_steering_shadow(
+                &planning_request,
+                &planning_receipt,
+                &layout,
+                &steering_layout,
+                &policy,
+            )?)?
+        }
+    };
+    write_json_output(
+        &invocation
+            .output_dir
+            .join("05-materialization-candidate.json"),
+        &materialization_candidate,
+    )?;
+
+    let shadow_input: ShadowEvaluationInput = read_json_bounded(invocation.shadow_input_path)?;
+    if shadow_input.bundle.candidate_sha256
+        != digest_field(&materialization_candidate, "manifest_sha256")?
+    {
+        return Err("shadow input candidate digest does not match materialized candidate".into());
+    }
+    if shadow_input.bundle.receiver_snapshot_sha256
+        != *planning_request.receiver_snapshot.manifest_digest()
+    {
+        return Err("shadow input receiver snapshot does not match planning receiver".into());
+    }
+    if shadow_input.bundle.strategy != backend.into_strategy() {
+        return Err("shadow input strategy does not match materialized backend".into());
+    }
+    let runner = AuthenticatedBytes::from_trusted_bytes(read_bytes_bounded(
+        invocation.runner_path,
+        64 * 1024 * 1024,
+    )?);
+    let shadow_evaluation = run_shadow_evaluation(
+        runner,
+        &shadow_input.bundle,
+        shadow_input.arguments,
+        shadow_input.limits,
+        shadow_input.requirements,
+    )?;
+    write_json_output(
+        &invocation
+            .output_dir
+            .join("06-shadow-evaluation-receipt.json"),
+        &shadow_evaluation,
+    )?;
+
+    let shadow_evaluations = vec![shadow_evaluation.clone()];
+    let selection_input = read_or_build_backend_selection_input(
+        invocation.selection_input_path,
+        &shadow_evaluations,
+    )?;
+    let selection_receipt = selection_input.execute()?;
+    write_json_output(
+        &invocation
+            .output_dir
+            .join("07-backend-selection-receipt.json"),
+        &selection_receipt,
+    )?;
+
+    let universality_input: UniversalityEvidenceInput =
+        read_json_bounded(invocation.universality_input_path)?;
+    let universality_receipt = universality_input.execute()?;
+    write_json_output(
+        &invocation.output_dir.join("08-universality-receipt.json"),
+        &universality_receipt,
+    )?;
+
+    let gate_request = read_or_build_promotion_gate_request(
+        invocation.promotion_input_path,
+        &selection_input,
+        &selection_receipt,
+        &universality_input,
+        &universality_receipt,
+        &shadow_evaluations,
+    )?;
+    let gate_receipt = evaluate_universal_promotion_gate(&gate_request)?;
+    write_json_output(
+        &invocation.output_dir.join("09-promotion-receipt.json"),
+        &gate_receipt,
+    )?;
+
+    let mut summary = std::collections::BTreeMap::<&str, String>::new();
+    summary.insert("receiver_profile_schema", receiver_profile.schema.clone());
+    summary.insert("discovery_report_schema", discovery_report.schema.clone());
+    summary.insert("planning_receipt_schema", planning_receipt.schema.clone());
+    summary.insert(
+        "materialization_schema",
+        materialization_candidate
+            .get("schema")
+            .and_then(Value::as_str)
+            .unwrap_or("cerebro.tidex.shadow_materialization_candidate/unknown/v1")
+            .to_string(),
+    );
+    summary.insert("shadow_evaluation_schema", shadow_evaluation.schema.clone());
+    summary.insert("selection_schema", selection_receipt.schema.clone());
+    summary.insert("universality_schema", universality_receipt.schema.clone());
+    summary.insert("promotion_schema", gate_receipt.schema.clone());
+    let summary = json!({
+        "schema": "cerebro.tidex.lab_e2e_summary/v1",
+        "output_directory": invocation.output_dir,
+        "backend": invocation.backend,
+        "schemas": summary
+    });
+    write_json_output(&invocation.output_dir.join("00-lab-summary.json"), &summary)?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+
+    Ok(())
 }
 
 fn read_bytes_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -395,5 +842,5 @@ fn acquire_workspace(
 }
 
 fn usage() -> &'static str {
-    "usage:\n  tidex workspace create <name> --target <absolute-path>\n  tidex workspace use <name>\n  tidex workspace show\n  tidex model add <name> --provider openai-compatible --url <endpoint> --model <model>\n  tidex model use <name>\n  tidex acquire [--path <relative-project-path>]\n  tidex benchmark portability <input.json>\n  tidex compile universal <input.json>\n  tidex compile universal-replay <input.json> <receipt.json>\n  tidex compile universal-plan <request.json>\n  tidex compile universal-plan-replay <request.json> <receipt.json>\n  tidex materialize dense <request.json> <receipt.json> <layout.json>\n  tidex materialize low-rank <request.json> <receipt.json> <layout.json> <policy.json>\n  tidex materialize sparse <request.json> <receipt.json> <layout.json> <policy.json>\n  tidex materialize steering <request.json> <receipt.json> <receiver-layout.json> <steering-layout.json> <policy.json>\n  tidex receiver inspect-safetensors <root> <request.json>\n  tidex discover capabilities <input.json>\n  tidex shadow run <runner> <input.json>\n  tidex select backend <input.json>\n  tidex measure universality <input.json>\n  tidex gate promotion <input.json>\n  tidex capabilities"
+    "usage:\n  tidex workspace create <name> --target <absolute-path>\n  tidex workspace use <name>\n  tidex workspace show\n  tidex model add <name> --provider openai-compatible --url <endpoint> --model <model>\n  tidex model use <name>\n  tidex acquire [--path <relative-project-path>]\n  tidex benchmark portability <input.json>\n  tidex compile universal <input.json>\n  tidex compile universal-replay <input.json> <receipt.json>\n  tidex compile universal-plan <request.json>\n  tidex compile universal-plan-replay <request.json> <receipt.json>\n  tidex materialize dense <request.json> <receipt.json> <layout.json>\n  tidex materialize low-rank <request.json> <receipt.json> <layout.json> <policy.json>\n  tidex materialize sparse <request.json> <receipt.json> <layout.json> <policy.json>\n  tidex materialize steering <request.json> <receipt.json> <receiver-layout.json> <steering-layout.json> <policy.json>\n  tidex receiver inspect-safetensors <root> <request.json>\n  tidex discover capabilities <input.json>\n  tidex shadow run <runner> <input.json>\n  tidex select backend <input.json>\n  tidex measure universality <input.json>\n  tidex gate promotion <input.json>\n  tidex lab e2e <model_root> <receiver-request.json> <discovery-request.json> <planning-request.json>\n            <backend> <layout.json> <backend-policy-or-none> <steering-layout-or-none>\n            <shadow-runner> <shadow-eval-input.json> <selection-input-or-policy.json> <universality-input.json> <promotion-request-or-policy.json> <output-dir>\n  tidex capabilities"
 }

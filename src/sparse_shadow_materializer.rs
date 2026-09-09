@@ -276,11 +276,13 @@ fn build_candidate(
             .get(start..end)
             .ok_or_else(|| BrainError::Integrity("sparse_range_invalid".into()))?;
         if affected.contains(&region.tensor_id) {
-            let budget = if remaining_elements == block.count {
+            let budget = if block.count == remaining_elements {
                 remaining_budget
-            } else {
+            } else if remaining_elements > 0 {
                 ((remaining_budget as u128 * block.count as u128) / remaining_elements as u128)
                     as usize
+            } else {
+                0
             }
             .max(usize::from(remaining_budget > 0))
             .min(block.count)

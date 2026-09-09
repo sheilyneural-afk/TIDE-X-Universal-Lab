@@ -14,15 +14,17 @@
   "latency_weight": 0.075,
   "memory_weight": 0.075,
   "required_controls": [
-    "unmodified_receiver",
-    "dense_delta",
+    "activation_steering",
+    "alternative_backend",
     "conventional_low_rank",
-    "wrong_capability_ir",
-    "random_delta",
+    "dense_delta",
     "mean_capability",
     "nearest_capability",
-    "alternative_backend",
-    "non_target_preservation"
+    "non_target_preservation",
+    "random_delta",
+    "sparse_delta",
+    "unmodified_receiver",
+    "wrong_capability_ir"
   ],
   "allow_hybrid": true,
   "minimum_hybrid_complementarity": 0.05

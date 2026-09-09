@@ -148,6 +148,16 @@ pub struct ShadowEvaluationInput {
     pub requirements: IsolationRequirements,
 }
 
+fn compact_process_text(bytes: &[u8]) -> String {
+    let mut text = String::from_utf8_lossy(bytes).replace(['\n', '\r'], "\\n");
+    const MAX_CHARS: usize = 512;
+    if text.chars().count() > MAX_CHARS {
+        text = text.chars().take(MAX_CHARS).collect();
+        text.push('…');
+    }
+    text
+}
+
 pub fn run_shadow_evaluation(
     runner: AuthenticatedBytes,
     bundle: &ShadowEvaluationBundle,
@@ -169,7 +179,13 @@ pub fn run_shadow_evaluation(
     })
     .map_err(|error| BrainError::Invalid(format!("shadow_runtime_isolation:{error}")))?;
     if report.termination != ExecutionTermination::ExitedSuccessfully || !report.succeeded() {
-        return Err(BrainError::Invalid("shadow_runtime_failed".into()));
+        return Err(BrainError::Invalid(format!(
+            "shadow_runtime_failed:termination={:?}:exit={:?}:stderr={}:stdout={}",
+            report.termination,
+            report.exit_code,
+            compact_process_text(&report.stderr),
+            compact_process_text(&report.stdout)
+        )));
     }
     let output: ShadowRuntimeOutput = serde_json::from_slice(&report.stdout)?;
     let unit = [
@@ -186,6 +202,10 @@ pub fn run_shadow_evaluation(
         || output.candidate_payload_sha256 != bundle.candidate_payload_sha256
         || output.evaluation_payload_sha256 != bundle.evaluation_payload_sha256
         || output.optimizer_steps != 0
+        || output.functional_ci_lower > output.functional_score
+        || output.latency_micros == 0
+        || output.resident_bytes == 0
+        || output.completed_controls.is_empty()
         || unit
             .iter()
             .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))

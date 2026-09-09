@@ -2,8 +2,9 @@
 //!
 //! This module intentionally accepts bytes, not paths. Before launch it verifies
 //! their declared SHA-256 identities and writes exactly one program and one input
-//! to sealed anonymous memory files. Bubblewrap receives individual read-only FD
-//! mounts; it never receives a source tree, CAS, private root, or workspace.
+//! to sealed anonymous memory files. Bubblewrap receives only those file
+//! descriptors and materializes them as read-only sandbox files; it never
+//! receives a source tree, CAS, private root, or workspace.
 
 use crate::digest::Sha256Digest;
 use serde::{Deserialize, Serialize};
@@ -21,8 +22,8 @@ use std::time::{Duration, Instant};
 
 const BWRAP: &str = "/usr/bin/bwrap";
 const PRLIMIT: &str = "/usr/bin/prlimit";
-const BACKEND_CONTRACT: &str = "linux_bubblewrap_sealed_memfd/v2";
-const REQUEST_DIGEST_DOMAIN: &[u8] = b"tidex.isolated_execution.request.v2\0";
+const BACKEND_CONTRACT: &str = "linux_bubblewrap_sealed_memfd_data_bind/v3";
+const REQUEST_DIGEST_DOMAIN: &[u8] = b"tidex.isolated_execution.request.v3\0";
 const VIRTUAL_PROGRAM: &str = "/tidex/program";
 const VIRTUAL_INPUT: &str = "/tidex/input";
 const MAX_PROGRAM_BYTES: usize = 64 * 1024 * 1024;
@@ -357,7 +358,7 @@ struct RequestCommitment<'a> {
 
 fn canonical_request_digest(request: &IsolatedExecutionRequest) -> IsolationResult<Sha256Digest> {
     let commitment = RequestCommitment {
-        schema_version: "isolated_execution_request/v2",
+        schema_version: "isolated_execution_request/v3",
         backend_contract: BACKEND_CONTRACT,
         program_digest: request.program.digest(),
         input_digest: request.input.digest(),
@@ -531,10 +532,14 @@ fn build_bwrap_arguments(
     arguments.extend([
         "--dir".into(),
         "/tidex".into(),
-        "--ro-bind-fd".into(),
+        "--perms".into(),
+        "0500".into(),
+        "--ro-bind-data".into(),
         program_fd.to_string(),
         VIRTUAL_PROGRAM.into(),
-        "--ro-bind-fd".into(),
+        "--perms".into(),
+        "0400".into(),
+        "--ro-bind-data".into(),
         input_fd.to_string(),
         VIRTUAL_INPUT.into(),
         "--proc".into(),
@@ -619,8 +624,9 @@ fn create_sealed_payload(
             mismatch,
         ));
     }
-    // Bubblewrap's `--ro-bind-fd` consumes these two explicitly named FDs. It
-    // closes them after constructing mounts and before executing the payload.
+    // Bubblewrap's `--ro-bind-data` consumes these two explicitly named FDs. It
+    // closes them after constructing read-only sandbox files and before
+    // executing the payload.
     rustix::io::fcntl_setfd(&file, rustix::io::FdFlags::empty()).map_err(staging_error)?;
     Ok(file)
 }
@@ -740,7 +746,7 @@ fn monitor_child(
         }
     };
     Ok(IsolatedExecutionReport {
-        schema_version: "isolated_execution_report/v2".into(),
+        schema_version: "isolated_execution_report/v3".into(),
         backend: BACKEND_CONTRACT.into(),
         request_digest,
         program_digest: request.program.digest.clone(),
@@ -1204,7 +1210,8 @@ mod tests {
             "--unshare-uts",
             "--clearenv",
             "--cap-drop",
-            "--ro-bind-fd",
+            "--ro-bind-data",
+            "--perms",
             "--size",
             "--remount-ro",
             VIRTUAL_PROGRAM,

@@ -8,6 +8,28 @@ use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 const MAX_EVALUATIONS: usize = 1_024;
+const MAX_RECORDED_CONTROLS: usize = 64;
+const MIN_REQUIRED_CONTROLS: &[ComparativeControl] = &[
+    ComparativeControl::UnmodifiedReceiver,
+    ComparativeControl::WrongCapabilityIr,
+    ComparativeControl::RandomDelta,
+    ComparativeControl::MeanCapability,
+    ComparativeControl::NearestCapability,
+    ComparativeControl::AlternativeBackend,
+    ComparativeControl::NonTargetPreservation,
+];
+
+fn minimum_controls_for_strategy(
+    strategy: MaterializationStrategy,
+) -> &'static [ComparativeControl] {
+    match strategy {
+        MaterializationStrategy::DenseDelta => &[ComparativeControl::DenseDelta],
+        MaterializationStrategy::LowRank => &[ComparativeControl::ConventionalLowRank],
+        MaterializationStrategy::SparseDelta => &[ComparativeControl::SparseDelta],
+        MaterializationStrategy::ActivationSteering => &[ComparativeControl::ActivationSteering],
+        _ => &[],
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -21,6 +43,8 @@ pub enum ComparativeControl {
     NearestCapability,
     AlternativeBackend,
     NonTargetPreservation,
+    SparseDelta,
+    ActivationSteering,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -83,6 +107,8 @@ impl BackendSelectionPolicy {
                 ComparativeControl::UnmodifiedReceiver,
                 ComparativeControl::DenseDelta,
                 ComparativeControl::ConventionalLowRank,
+                ComparativeControl::SparseDelta,
+                ComparativeControl::ActivationSteering,
                 ComparativeControl::WrongCapabilityIr,
                 ComparativeControl::RandomDelta,
                 ComparativeControl::MeanCapability,
@@ -116,12 +142,13 @@ impl BackendSelectionPolicy {
                 .iter()
                 .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
             || !self.minimum_identity_margin.is_finite()
-            || self.minimum_identity_margin < 0.0
+            || !(0.0..=1.0).contains(&self.minimum_identity_margin)
             || self.maximum_latency_micros == 0
             || self.maximum_resident_bytes == 0
             || weights.iter().any(|v| !v.is_finite() || *v < 0.0)
             || weights.iter().sum::<f64>() <= 0.0
-            || self.required_controls.is_empty()
+            || !BTreeSet::from_iter(MIN_REQUIRED_CONTROLS.iter().copied())
+                .is_subset(&self.required_controls)
         {
             return Err(BrainError::Invalid(
                 "backend_selection_policy_invalid".into(),
@@ -206,11 +233,26 @@ fn validate_evaluation(e: &BackendEvaluation) -> BrainResult<()> {
             .iter()
             .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
         || !e.identity_margin.is_finite()
-        || e.identity_margin < 0.0
+        || !(0.0..=1.0).contains(&e.identity_margin)
+        || e.functional_ci_lower > e.functional_score
+        || e.latency_micros == 0
+        || e.resident_bytes == 0
+        || e.completed_controls.is_empty()
+        || e.completed_controls.len() > MAX_RECORDED_CONTROLS
     {
         return Err(BrainError::Invalid("backend_evaluation_invalid".into()));
     }
     Ok(())
+}
+
+fn has_required_controls(policy: &BackendSelectionPolicy, evaluation: &BackendEvaluation) -> bool {
+    let mut required = policy.required_controls.clone();
+    for required_control in minimum_controls_for_strategy(evaluation.strategy) {
+        required.insert(*required_control);
+    }
+    required
+        .iter()
+        .all(|control| evaluation.completed_controls.contains(control))
 }
 
 fn dominates(a: &BackendEvaluation, b: &BackendEvaluation) -> bool {
@@ -257,7 +299,7 @@ pub fn select_materialization_backend(
                 && e.normalized_risk <= policy.maximum_normalized_risk
                 && e.latency_micros <= policy.maximum_latency_micros
                 && e.resident_bytes <= policy.maximum_resident_bytes
-                && policy.required_controls.is_subset(&e.completed_controls)
+                && has_required_controls(policy, e)
         })
         .collect::<Vec<_>>();
     if admitted.is_empty() {
@@ -403,5 +445,131 @@ mod tests {
             receipt.selected_strategy,
             MaterializationStrategy::SparseDelta
         );
+    }
+
+    #[test]
+    fn rejects_candidate_missing_global_comparatives() {
+        let policy = BackendSelectionPolicy::rigorous_default(100, 100);
+        let mut sparse = evaluation(b"sparse", MaterializationStrategy::SparseDelta, 0.90);
+        sparse
+            .completed_controls
+            .remove(&ComparativeControl::WrongCapabilityIr);
+        assert!(
+            select_materialization_backend(&[sparse], &[], &policy).is_err(),
+            "missing required comparative controls must fail"
+        );
+    }
+
+    #[test]
+    fn rejects_low_rank_without_low_rank_specific_gate() {
+        let policy = BackendSelectionPolicy::rigorous_default(100, 100);
+        let mut low_rank = evaluation(b"lowrank", MaterializationStrategy::LowRank, 0.91);
+        low_rank
+            .completed_controls
+            .remove(&ComparativeControl::ConventionalLowRank);
+        assert!(
+            select_materialization_backend(&[low_rank], &[], &policy).is_err(),
+            "low-rank must satisfy low-rank comparative controls"
+        );
+    }
+
+    #[test]
+    fn sparse_and_steering_require_strategy_specific_gates() {
+        let policy = BackendSelectionPolicy::rigorous_default(100, 100);
+        let mut sparse = evaluation(b"sparse", MaterializationStrategy::SparseDelta, 0.92);
+        sparse
+            .completed_controls
+            .remove(&ComparativeControl::SparseDelta);
+        assert!(
+            select_materialization_backend(&[sparse], &[], &policy).is_err(),
+            "sparse must satisfy sparse comparative controls"
+        );
+
+        let mut steering = evaluation(
+            b"steering",
+            MaterializationStrategy::ActivationSteering,
+            0.92,
+        );
+        steering
+            .completed_controls
+            .remove(&ComparativeControl::ActivationSteering);
+        assert!(
+            select_materialization_backend(&[steering], &[], &policy).is_err(),
+            "activation steering must satisfy steering comparative controls"
+        );
+    }
+
+    #[test]
+    fn hybrid_is_ignored_when_gain_or_controls_are_insufficient() {
+        let policy = BackendSelectionPolicy::rigorous_default(100, 100);
+        let sparse = evaluation(b"sparse", MaterializationStrategy::SparseDelta, 0.91);
+        let dense = evaluation(b"dense", MaterializationStrategy::DenseDelta, 0.92);
+        let weak_gain = PairwiseComplementarity {
+            first_candidate_sha256: sparse.candidate_sha256.clone(),
+            second_candidate_sha256: dense.candidate_sha256.clone(),
+            held_out_gain: 0.01,
+            preservation_delta: 0.5,
+        };
+        let no_hybrid = select_materialization_backend(
+            &[sparse.clone(), dense.clone()],
+            std::slice::from_ref(&weak_gain),
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(
+            no_hybrid.selected_strategy,
+            MaterializationStrategy::DenseDelta
+        );
+        let strong_pair = PairwiseComplementarity {
+            first_candidate_sha256: sparse.candidate_sha256.clone(),
+            second_candidate_sha256: dense.candidate_sha256.clone(),
+            held_out_gain: 0.1,
+            preservation_delta: 0.5,
+        };
+        let hybrid = select_materialization_backend(
+            &[sparse.clone(), dense.clone()],
+            std::slice::from_ref(&strong_pair),
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(hybrid.selected_strategy, MaterializationStrategy::Hybrid);
+        let mut poor_controls = dense.clone();
+        poor_controls
+            .completed_controls
+            .remove(&ComparativeControl::ConventionalLowRank);
+        let fallback_when_controls_are_insufficient = select_materialization_backend(
+            &[sparse, poor_controls],
+            std::slice::from_ref(&strong_pair),
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(
+            fallback_when_controls_are_insufficient.selected_strategy,
+            MaterializationStrategy::SparseDelta
+        );
+    }
+
+    #[test]
+    fn rejects_impossible_or_empty_backend_evidence() {
+        let policy = BackendSelectionPolicy::rigorous_default(100, 100);
+        let mut impossible_ci = evaluation(b"ci", MaterializationStrategy::DenseDelta, 0.90);
+        impossible_ci.functional_ci_lower = 0.91;
+        assert!(select_materialization_backend(&[impossible_ci], &[], &policy).is_err());
+
+        let mut zero_latency = evaluation(b"latency", MaterializationStrategy::DenseDelta, 0.90);
+        zero_latency.latency_micros = 0;
+        assert!(select_materialization_backend(&[zero_latency], &[], &policy).is_err());
+
+        let mut missing_controls =
+            evaluation(b"controls", MaterializationStrategy::DenseDelta, 0.90);
+        missing_controls.completed_controls.clear();
+        assert!(select_materialization_backend(&[missing_controls], &[], &policy).is_err());
+    }
+
+    #[test]
+    fn policy_validation_fails_when_min_controls_are_weakened() {
+        let mut policy = BackendSelectionPolicy::rigorous_default(100, 100);
+        policy.required_controls = BTreeSet::from([ComparativeControl::UnmodifiedReceiver]);
+        assert!(policy.validate().is_err());
     }
 }

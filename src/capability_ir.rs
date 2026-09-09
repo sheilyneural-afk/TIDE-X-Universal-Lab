@@ -881,10 +881,10 @@ impl OperationalCapabilityContract {
                 .sum::<f64>()
                 .sqrt();
             let ratio = if pre <= 1e-15 {
-                if closure <= 1e-15 {
+                if closure <= self.maximum_closure_error {
                     0.0
                 } else {
-                    f64::INFINITY
+                    1.0
                 }
             } else {
                 closure / pre
@@ -1589,6 +1589,51 @@ mod tests {
         let mut bad_contraction = contract;
         bad_contraction.transitions[0].post_target_error = 0.1;
         assert!(bad_contraction.validate_against(&ir).is_err());
+
+        let identity_contract = OperationalCapabilityContract {
+            schema: "cerebro.tidex.operational_capability/v1".into(),
+            capability_id: ir.capability_id().clone(),
+            capability_ir_sha256: ir.manifest_digest().clone(),
+            state_dimension: 2,
+            anchors: vec![
+                StateIrAnchor {
+                    anchor_id: "s0".into(),
+                    state: vec![1.0, 0.0],
+                },
+                StateIrAnchor {
+                    anchor_id: "s1".into(),
+                    state: vec![0.0, 1.0],
+                },
+            ],
+            transitions: vec![
+                OperatorIrTransition {
+                    operator_id: "identity".into(),
+                    source_anchor_id: "s0".into(),
+                    target_anchor_id: "s0".into(),
+                    observed_next_state: vec![1.0, 0.0],
+                    pre_target_error: 0.0,
+                    post_target_error: 0.0,
+                },
+                OperatorIrTransition {
+                    operator_id: "identity".into(),
+                    source_anchor_id: "s1".into(),
+                    target_anchor_id: "s1".into(),
+                    observed_next_state: vec![0.0, 1.0],
+                    pre_target_error: 0.0,
+                    post_target_error: 0.0,
+                },
+            ],
+            maximum_closure_error: 0.001,
+            maximum_contraction_ratio: 0.001,
+        };
+        let verified = identity_contract
+            .verify_receiver_signature(&ir, &[1.0, 0.0001, 0.0, 0.9999])
+            .unwrap();
+        assert!(verified.allowed);
+        let rejected = identity_contract
+            .verify_receiver_signature(&ir, &[1.0, 0.01, 0.0, 0.99])
+            .unwrap();
+        assert!(!rejected.allowed);
         fs::remove_dir_all(root).unwrap();
     }
 }

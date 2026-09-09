@@ -168,10 +168,14 @@ pub fn fingerprint_architecture(
         .get("is_encoder_decoder")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
-    let encoder_only = declared_architectures
-        .iter()
-        .any(|value| value.to_ascii_lowercase().contains("maskedlm"))
-        && !encoder_decoder;
+    let encoder_only = !encoder_decoder
+        && (matches!(
+            model_type.as_deref(),
+            Some("bert" | "roberta" | "distilbert" | "xlm-roberta" | "mpnet")
+        ) || declared_architectures.iter().any(|value| {
+            let value = value.to_ascii_lowercase();
+            value.contains("maskedlm") || value == "bertmodel" || value.ends_with("model")
+        }) || joined.contains("encoder.layer"));
     let model_family = if multimodal {
         ModelFamily::Multimodal
     } else if has_moe {
@@ -254,6 +258,25 @@ mod tests {
         assert_eq!(
             report.receiver_architecture,
             ReceiverArchitecture::MixtureOfExperts
+        );
+    }
+
+    #[test]
+    fn detects_bert_model_as_encoder_transformer() {
+        let config = br#"{"model_type":"bert","architectures":["BertModel"]}"#;
+        let report = fingerprint_architecture(
+            config,
+            &[
+                "embeddings.word_embeddings.weight".into(),
+                "encoder.layer.0.attention.self.query.weight".into(),
+                "encoder.layer.0.intermediate.dense.weight".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(report.model_family, ModelFamily::EncoderTransformer);
+        assert_eq!(
+            report.receiver_architecture,
+            ReceiverArchitecture::Transformer
         );
     }
 }

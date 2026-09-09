@@ -76,4 +76,5 @@ pub mod sparse_shadow_materializer;
 pub mod trust_region;
 pub mod universal_capability_compiler;
 pub mod universal_promotion_gate;
+pub mod universal_shadow_runner;
 pub mod universality_evidence;
